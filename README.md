@@ -16,12 +16,12 @@ ps2dis# is a disassembler for PS2 binaries and a debugger for PCSX2. It is heavi
 - The Code Manager has 3 tabs: Codes, Patch Memory, and Search. The codes tab is for inputting raw hex codes similar to gameshark, and the codes are constantly written to memory. It supports 0, 1, 2, and D type codes. The Patch Memory tab is for patching memory. The codes in this tab are written to memory once, then cleared from the codes list. The Search tab is setup similar to Cheat Engine.
 - Supports PC, read, and write breakpoints.
 - Placing the access monitor on an address will show you what accesses the address. This can cause the game to slow down due to the constant pausing/resuming of PCSX2.
-- Supports labeling dynamic objects such as a PlayerObject and storing them in a PCSX2dis project file.
-#Example
-0020446C:MyObject
-0000:Field1
-0004:Field2
-0008:Field3
+- Supports labeling dynamic objects such as a PlayerObject and storing them in a PCSX2dis project file.  
+#Example  
+0020446C:MyObject  
+0000:Field1  
+0004:Field2  
+0008:Field3  
 
 **Hotkeys**
 - Go to Address: G
