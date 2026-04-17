@@ -32,9 +32,10 @@ ps2dis# is a disassembler for PS2 binaries and a debugger for PCSX2. It is heavi
 - Toggle Breakpoints sidebar: CTRL-B
 
 **[Credits]**
-1UP - Started the ps2dis# project.
-gtlcpimp - Creator of Code Designer.
-Hanimar - Creator of ps2dis.
-LXShadow - Creator of PCSX2dis.
-Sebastiano Gelmetti - Creator of PCSX2-MCP
-ChatGPT & Claude - Writing and breaking the code.
+
+1UP - Started the ps2dis# project  
+gtlcpimp - Creator of Code Designer  
+Hanimar - Creator of ps2dis  
+LXShadow - Creator of PCSX2dis  
+Sebastiano Gelmetti - Creator of PCSX2-MCP  
+ChatGPT & Claude - Writing and breaking the code  
