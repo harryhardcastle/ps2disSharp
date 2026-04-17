@@ -18,8 +18,8 @@ ps2dis# is a disassembler for PS2 binaries and a debugger for PCSX2. It is heavi
 - Placing the access monitor on an address will show you what accesses the address. This can cause the game to slow down due to the constant pausing/resuming of PCSX2.
 - Supports labeling dynamic objects such as a PlayerObject and storing them in a PCSX2dis project file.  
 #Example  
-0020446C:MyObject  
-0000:Field1  
+0020446C:MyObject  # Address:ObjectName  
+0000:Field1        # Offset 0x0:Label  
 0004:Field2  
 0008:Field3  
 
