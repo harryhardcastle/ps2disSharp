@@ -1,3 +1,6 @@
+<img width="728" height="608" alt="28" src="https://github.com/user-attachments/assets/fc99e448-cd3f-4cb5-9fc1-61e05b5760c4" />
+
+
 **Description**
 
 ps2dis# is a disassembler for PS2 binaries and a debugger for PCSX2. It is heavily based on the design of ps2dis and PCSX2dis. It uses PCSX2-MCP and PINE to communicate with a modified PCSX2.
