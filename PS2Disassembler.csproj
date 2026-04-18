@@ -4,19 +4,28 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
-    <AssemblyName>ps2dis#</AssemblyName>
+    <AssemblyName>ps2dis</AssemblyName>
     <RootNamespace>PS2Disassembler</RootNamespace>
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
     <Optimize>true</Optimize>
-    <ApplicationIcon>icon.ico</ApplicationIcon>
+    <ApplicationIcon>assets\icon.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
-    <Content Include="icon.ico">
+    <Content Include="assets\icon.ico">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Folder Include="assets\" />
+    <Folder Include="debug\" />
+    <Folder Include="disassembler\" />
+    <Folder Include="disassembler\tests\" />
+    <Folder Include="main\" />
+    <Folder Include="mips\" />
   </ItemGroup>
 
 </Project>

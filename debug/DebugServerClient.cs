@@ -11,8 +11,8 @@ namespace PS2Disassembler
 {
     internal sealed class DebugServerClient : IDisposable
     {
-        private const string Host = "127.0.0.1";
-        private const int Port = 21512;
+        private string _host = AppSettings.DefaultDebugHost;
+        private int _port = AppSettings.DefaultMcpPort;
         private const int ConnectTimeoutMs = 2000;
         private const int IoTimeoutMs = 3000;
 
@@ -21,6 +21,9 @@ namespace PS2Disassembler
         private NetworkStream? _stream;
         private StreamReader? _reader;
         private StreamWriter? _writer;
+
+        public string Host => _host;
+        public int Port => _port;
 
         public bool IsConnected
         {
@@ -33,6 +36,20 @@ namespace PS2Disassembler
             }
         }
 
+        public void Configure(string? host, int port)
+        {
+            lock (_sync)
+            {
+                string nextHost = AppSettings.NormalizeDebugHost(host);
+                int nextPort = AppSettings.NormalizePort(port, AppSettings.DefaultMcpPort);
+                bool endpointChanged = !string.Equals(_host, nextHost, StringComparison.OrdinalIgnoreCase) || _port != nextPort;
+                _host = nextHost;
+                _port = nextPort;
+                if (endpointChanged)
+                    DisconnectLocked();
+            }
+        }
+
         public void Connect(int timeoutMs = ConnectTimeoutMs)
         {
             lock (_sync)
@@ -40,7 +57,7 @@ namespace PS2Disassembler
                 DisconnectLocked();
 
                 var client = new TcpClient();
-                var ar = client.BeginConnect(Host, Port, null, null);
+                var ar = client.BeginConnect(_host, _port, null, null);
                 if (!ar.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(timeoutMs)))
                 {
                     client.Close();
@@ -369,7 +386,7 @@ namespace PS2Disassembler
                 try
                 {
                     var client = new TcpClient();
-                    var ar = client.BeginConnect(Host, Port, null, null);
+                    var ar = client.BeginConnect(_host, _port, null, null);
                     if (!ar.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(ConnectTimeoutMs)))
                     {
                         client.Close();

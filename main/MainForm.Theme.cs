@@ -52,6 +52,27 @@ namespace PS2Disassembler
             return Color.FromArgb(color.A, Brighten(color.R), Brighten(color.G), Brighten(color.B));
         }
 
+
+        private Color GetOptionsDialogBackColor()
+        {
+            return _currentTheme == AppTheme.Dark
+                ? Color.FromArgb(33, 36, 42)
+                : Color.FromArgb(232, 235, 240);
+        }
+
+        private Color GetOptionsSurfaceBackColor()
+        {
+            return _currentTheme == AppTheme.Dark
+                ? Color.FromArgb(48, 52, 60)
+                : Color.FromArgb(250, 251, 253);
+        }
+
+
+        private Color GetCheckBoxBackColor(Control? parent)
+        {
+            return Equals(parent?.Tag, "OptionsSurface") ? GetOptionsSurfaceBackColor() : _themeFormBack;
+        }
+
         private void SetRegisterPalette(float lightFactor, float darkBrightenFactor)
         {
             Color Adjust(Color c) => _currentTheme == AppTheme.Dark ? BrightenColor(c, darkBrightenFactor) : ScaleColor(c, lightFactor);
@@ -248,6 +269,7 @@ namespace PS2Disassembler
             foreach (Form owned in OwnedForms)
             {
                 ApplyThemeToControlTree(owned);
+                ApplyScrollbarTheme(owned, dark);
                 ApplyThemeToWindowChrome(owned, forceFrameRefresh);
             }
 
@@ -446,14 +468,20 @@ namespace PS2Disassembler
                     // Attach custom disabled-text painting for dark theme so text stays legible
                     AttachDisabledButtonPainter(btn, _currentTheme == AppTheme.Dark);
                     break;
+                case ThemedCheckBox tcb:
+                    tcb.ForeColor = _themeFormFore;
+                    tcb.BackColor = GetCheckBoxBackColor(tcb.Parent);
+                    tcb.FlatStyle = FlatStyle.Flat;
+                    tcb.ApplyPalette(_currentTheme == AppTheme.Dark, GetCheckBoxBackColor(tcb.Parent), _themeFormFore);
+                    break;
                 case CheckBox cbx:
                     cbx.ForeColor = _themeFormFore;
-                    cbx.BackColor = _themeFormBack;
+                    cbx.BackColor = GetCheckBoxBackColor(cbx.Parent);
                     cbx.FlatStyle = FlatStyle.Flat;
                     break;
                 case RadioButton rb:
                     rb.ForeColor = _themeFormFore;
-                    rb.BackColor = _themeFormBack;
+                    rb.BackColor = Equals(rb.Parent?.Tag, "OptionsSurface") ? GetOptionsSurfaceBackColor() : _themeFormBack;
                     rb.FlatStyle = FlatStyle.Flat;
                     break;
                 case Label lbl:
@@ -485,6 +513,24 @@ namespace PS2Disassembler
                         foreach (Control inner in th.Controls)
                             inner.BackColor = _themeCodeManagerBack;
                     }
+                    else if (Equals(th.Tag, "OptionsTabHost"))
+                    {
+                        Color optionsDialogBack = GetOptionsDialogBackColor();
+                        Color optionsSurfaceBack = GetOptionsSurfaceBackColor();
+                        th.BackColor = optionsDialogBack;
+                        th.TabStripBackColorOverride = optionsDialogBack;
+                        th.ContentBackColorOverride = optionsSurfaceBack;
+                        th.Margin = new Padding(0);
+                        th.DimTabs = false;
+                        th.ApplyPalette(_currentTheme == AppTheme.Dark, optionsDialogBack, _themeFormFore);
+                        foreach (Control inner in th.Controls)
+                        {
+                            if (inner is FlowLayoutPanel)
+                                inner.BackColor = optionsDialogBack;
+                            else
+                                inner.BackColor = optionsSurfaceBack;
+                        }
+                    }
                     else
                     {
                         th.DimTabs = false;
@@ -495,6 +541,8 @@ namespace PS2Disassembler
                 case FlatTabPage tp:
                     if (Equals(tp.Tag, "CodeManagerPage") || Equals(tp.Tag, "CodeManagerHostPage"))
                         tp.BackColor = _themeCodeManagerBack;
+                    else if (Equals(tp.Tag, "OptionsTabPage"))
+                        tp.BackColor = GetOptionsSurfaceBackColor();
                     else if (ReferenceEquals(tp, _memoryViewPage))
                         tp.BackColor = _hexList.BackColor;
                     else
@@ -509,6 +557,10 @@ namespace PS2Disassembler
                         if (Equals(pnl.Tag, "CodeManagerPanel"))
                             pnl.Padding = new Padding(1);
                     }
+                    else if (Equals(pnl.Tag, "OptionsSurface"))
+                    {
+                        pnl.BackColor = GetOptionsSurfaceBackColor();
+                    }
                     else if (pnl.Parent is FlatTabHost)
                     {
                         // Don't override the content host panel inside a FlatTabHost — ApplyPalette manages it
@@ -516,6 +568,10 @@ namespace PS2Disassembler
                     else
                         pnl.BackColor = _themeFormBack;
                     pnl.ForeColor = _themeFormFore;
+                    break;
+                case Form form:
+                    form.BackColor = form is OptionsDialog ? GetOptionsDialogBackColor() : _themeFormBack;
+                    form.ForeColor = _themeFormFore;
                     break;
                 default:
                     // Don't override FlowLayoutPanel colors inside a FlatTabHost — ApplyPalette manages those
@@ -586,6 +642,143 @@ namespace PS2Disassembler
                     TextRenderer.DrawText(e.Graphics, b.Text, b.Font, b.ClientRectangle, disabledFore,
                         TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
                 };
+            }
+        }
+
+        internal sealed class ThemedCheckBox : CheckBox
+        {
+            private bool _dark;
+            private Color _surfaceBack;
+            private Color _textFore;
+
+            public ThemedCheckBox()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint |
+                         ControlStyles.UserPaint |
+                         ControlStyles.OptimizedDoubleBuffer |
+                         ControlStyles.ResizeRedraw |
+                         ControlStyles.SupportsTransparentBackColor, true);
+                AutoSize = true;
+                UseVisualStyleBackColor = false;
+            }
+
+            public void ApplyPalette(bool dark, Color surfaceBack, Color textFore)
+            {
+                _dark = dark;
+                _surfaceBack = surfaceBack;
+                _textFore = textFore;
+                if (AutoSize)
+                    Size = GetPreferredSize(Size.Empty);
+                Invalidate();
+            }
+
+            public override Size GetPreferredSize(Size proposedSize)
+            {
+                Size textSize = TextRenderer.MeasureText(Text ?? string.Empty, Font, new Size(int.MaxValue, int.MaxValue),
+                    TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
+                int width = 14 + 6 + textSize.Width + Padding.Horizontal + 2;
+                int height = Math.Max(14, textSize.Height) + Padding.Vertical;
+                return new Size(width, height);
+            }
+
+            protected override void SetBoundsCore(int x, int y, int width, int height, BoundsSpecified specified)
+            {
+                if (AutoSize)
+                {
+                    Size preferred = GetPreferredSize(Size.Empty);
+                    width = preferred.Width;
+                    height = preferred.Height;
+                }
+                base.SetBoundsCore(x, y, width, height, specified);
+            }
+
+            protected override void OnTextChanged(EventArgs e)
+            {
+                base.OnTextChanged(e);
+                if (AutoSize)
+                    Size = GetPreferredSize(Size.Empty);
+                Invalidate();
+            }
+
+            protected override void OnFontChanged(EventArgs e)
+            {
+                base.OnFontChanged(e);
+                if (AutoSize)
+                    Size = GetPreferredSize(Size.Empty);
+                Invalidate();
+            }
+
+            protected override void OnPaddingChanged(EventArgs e)
+            {
+                base.OnPaddingChanged(e);
+                if (AutoSize)
+                    Size = GetPreferredSize(Size.Empty);
+                Invalidate();
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                e.Graphics.Clear(BackColor);
+
+                Color surfaceBack = _surfaceBack.IsEmpty ? BackColor : _surfaceBack;
+                Color textFore = _textFore.IsEmpty ? ForeColor : _textFore;
+                bool enabled = Enabled;
+                Color boxBack = _dark ? ScaleColor(surfaceBack, 0.75f) : Color.White;
+                Color border = _dark ? Color.FromArgb(104, 110, 120) : Color.FromArgb(150, 156, 166);
+                Color check = _dark ? Color.FromArgb(232, 236, 242) : Color.FromArgb(46, 84, 140);
+
+                if (!enabled)
+                {
+                    boxBack = _dark ? ScaleColor(boxBack, 0.88f) : ScaleColor(boxBack, 0.96f);
+                    border = _dark ? Color.FromArgb(74, 80, 88) : Color.FromArgb(178, 182, 188);
+                    textFore = _dark ? Color.FromArgb(132, 136, 144) : Color.FromArgb(132, 136, 144);
+                    check = _dark ? Color.FromArgb(148, 152, 160) : Color.FromArgb(144, 148, 156);
+                }
+
+                int boxSize = 13;
+                int boxY = Math.Max(0, (ClientSize.Height - boxSize) / 2);
+                var boxRect = new Rectangle(0, boxY, boxSize, boxSize);
+                using (var boxBrush = new SolidBrush(boxBack))
+                    e.Graphics.FillRectangle(boxBrush, boxRect);
+                using (var borderPen = new Pen(border))
+                    e.Graphics.DrawRectangle(borderPen, boxRect);
+
+                if (CheckState == CheckState.Checked)
+                {
+                    using var pen = new Pen(check, 2f)
+                    {
+                        StartCap = System.Drawing.Drawing2D.LineCap.Round,
+                        EndCap = System.Drawing.Drawing2D.LineCap.Round
+                    };
+                    e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                    e.Graphics.DrawLines(pen, new[]
+                    {
+                        new Point(boxRect.Left + 3, boxRect.Top + 7),
+                        new Point(boxRect.Left + 5, boxRect.Top + 9),
+                        new Point(boxRect.Left + 10, boxRect.Top + 4)
+                    });
+                    e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.Default;
+                }
+                else if (CheckState == CheckState.Indeterminate)
+                {
+                    var dashRect = new Rectangle(boxRect.Left + 3, boxRect.Top + 5, boxRect.Width - 6, 3);
+                    using var dashBrush = new SolidBrush(check);
+                    e.Graphics.FillRectangle(dashBrush, dashRect);
+                }
+
+                Rectangle textRect = new Rectangle(boxRect.Right + 6, 0, Math.Max(0, ClientSize.Width - (boxRect.Right + 6)), ClientSize.Height);
+                TextFormatFlags textFlags = TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding;
+                if (!AutoSize)
+                    textFlags |= TextFormatFlags.EndEllipsis;
+                TextRenderer.DrawText(e.Graphics, Text ?? string.Empty, Font, textRect, textFore, textFlags);
+
+                if (Focused && ShowFocusCues)
+                {
+                    Rectangle focusRect = textRect;
+                    focusRect.Width = Math.Max(0, Math.Min(textRect.Width, TextRenderer.MeasureText(Text ?? string.Empty, Font).Width));
+                    focusRect.Inflate(1, -2);
+                    ControlPaint.DrawFocusRectangle(e.Graphics, focusRect, textFore, BackColor);
+                }
             }
         }
 
@@ -1120,7 +1313,7 @@ namespace PS2Disassembler
                             (int)(c.R * 0.97f),
                             (int)(c.G * 0.97f),
                             (int)(c.B * 0.97f));
-                        using var pen = new Pen(borderColor, 2);
+                        using var pen = new Pen(borderColor, 1);
                         e.Graphics.DrawLine(pen, 0, Height - 1, Width, Height - 1);
                     }
                 }
@@ -1431,7 +1624,7 @@ namespace PS2Disassembler
         private void ShowOptionsDialog()
         {
             using var dlg = new OptionsDialog(_appSettings, _currentTheme == AppTheme.Dark);
-            dlg.BackColor = _themeFormBack;
+            dlg.BackColor = GetOptionsDialogBackColor();
             dlg.ForeColor = _themeFormFore;
             ApplyThemeToControlTree(dlg);
             dlg.Load += (_, _) => ApplyThemeToWindowChrome(dlg, forceFrameRefresh: true);
@@ -1444,13 +1637,27 @@ namespace PS2Disassembler
                 bool themeChanged = _appSettings.Theme != dlg.SelectedTheme;
                 bool refreshRateChanged = _appSettings.RefreshRate != dlg.SelectedRefreshRate;
                 bool constantWriteRateChanged = _appSettings.ConstantWriteRate != dlg.SelectedConstantWriteRate;
+                bool memoryViewVisibilityChanged = _appSettings.ShowMemoryView != dlg.SelectedShowMemoryView;
+                bool debugEndpointChanged = !string.Equals(_appSettings.DebugHost, dlg.SelectedDebugHost, StringComparison.OrdinalIgnoreCase)
+                                         || _appSettings.PinePort != dlg.SelectedPinePort
+                                         || _appSettings.McpPort != dlg.SelectedMcpPort;
 
                 _appSettings.FontFamily = dlg.SelectedFontFamily;
                 _appSettings.FontSize = dlg.SelectedFontSize;
                 _appSettings.Theme = dlg.SelectedTheme;
                 _appSettings.RefreshRate = dlg.SelectedRefreshRate;
                 _appSettings.ConstantWriteRate = dlg.SelectedConstantWriteRate;
+                _appSettings.ShowMemoryView = dlg.SelectedShowMemoryView;
+                _appSettings.DebugHost = dlg.SelectedDebugHost;
+                _appSettings.PinePort = dlg.SelectedPinePort;
+                _appSettings.McpPort = dlg.SelectedMcpPort;
                 _appSettings.Save();
+
+                if (debugEndpointChanged)
+                {
+                    ApplyDebugConnectionSettings();
+                    ResetLiveDebugConnectionsAfterEndpointChange();
+                }
 
                 if (fontChanged)
                     ApplyFontFromSettings(_appSettings.FontFamily, _appSettings.FontSize);
@@ -1461,6 +1668,9 @@ namespace PS2Disassembler
                 if (constantWriteRateChanged)
                     UpdateConstantWriteTimerInterval();
 
+                if (memoryViewVisibilityChanged)
+                    ApplyMemoryViewVisibilitySetting();
+
                 if (themeChanged)
                 {
                     var newTheme = _appSettings.Theme == "Light" ? AppTheme.Light : AppTheme.Dark;
@@ -1468,7 +1678,7 @@ namespace PS2Disassembler
                     BeginInvoke((Action)(() => RefreshTitleBarTheme(forceFrameRefresh: true)));
 
                     // Re-theme the options dialog itself so it stays consistent
-                    dlg.BackColor = _themeFormBack;
+                    dlg.BackColor = GetOptionsDialogBackColor();
                     dlg.ForeColor = _themeFormFore;
                     ApplyThemeToControlTree(dlg);
                     ApplyThemeToWindowChrome(dlg, forceFrameRefresh: true);
@@ -1476,6 +1686,18 @@ namespace PS2Disassembler
             };
 
             dlg.ShowDialog(this);
+        }
+
+        private void ApplyMemoryViewVisibilitySetting()
+        {
+            bool showMemoryView = _appSettings?.ShowMemoryView ?? AppSettings.DefaultShowMemoryView;
+
+            _mainTabs?.SetTabVisible(1, showMemoryView);
+            if (_miGoToMemoryView != null)
+                _miGoToMemoryView.Visible = showMemoryView;
+
+            if (!showMemoryView && _mainTabs != null && _mainTabs.SelectedIndex == 1)
+                _mainTabs.SelectedIndex = 0;
         }
 
         protected override void Dispose(bool disposing)

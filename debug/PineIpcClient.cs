@@ -7,8 +7,8 @@ namespace PS2Disassembler
 {
     internal sealed class PineIpcClient : IDisposable
     {
-        private const string Host = "127.0.0.1";
-        private const int Port = 28011;
+        private string _host = AppSettings.DefaultDebugHost;
+        private int _port = AppSettings.DefaultPinePort;
 
         private TcpClient? _client;
         private NetworkStream? _stream;
@@ -48,6 +48,22 @@ namespace PS2Disassembler
         }
 
         public bool IsConnected => _client?.Connected == true && _stream != null;
+        public string Host => _host;
+        public int Port => _port;
+
+        public void Configure(string? host, int port)
+        {
+            lock (_sync)
+            {
+                string nextHost = AppSettings.NormalizeDebugHost(host);
+                int nextPort = AppSettings.NormalizePort(port, AppSettings.DefaultPinePort);
+                bool endpointChanged = !string.Equals(_host, nextHost, StringComparison.OrdinalIgnoreCase) || _port != nextPort;
+                _host = nextHost;
+                _port = nextPort;
+                if (endpointChanged)
+                    Disconnect();
+            }
+        }
 
         public void Connect()
         {
@@ -55,7 +71,7 @@ namespace PS2Disassembler
             {
                 Disconnect();
                 var client = new TcpClient();
-                var ar = client.BeginConnect(Host, Port, null, null);
+                var ar = client.BeginConnect(_host, _port, null, null);
                 if (!ar.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(150)))
                 {
                     client.Close();

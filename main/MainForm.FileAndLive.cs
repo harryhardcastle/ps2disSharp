@@ -39,7 +39,7 @@ namespace PS2Disassembler
                 _disasmList.Columns[0].Width = addressWidth;
             if (_showHex && _disasmList.Columns.Count > 1)
             {
-                int hexWidth = ScaleColumnWidthFromDefault("00000000", 64);
+                int hexWidth = ScaleColumnWidthFromDefault("00000000*", 64);
                 if (_disasmList.Columns[1].Width != hexWidth)
                     _disasmList.Columns[1].Width = hexWidth;
             }
@@ -69,14 +69,6 @@ namespace PS2Disassembler
                 }));
             }
         }
-
-        private void ApplyHeaderFont(ListView list, Font font)
-        {
-            IntPtr header = NativeMethods.SendMessage(list.Handle, NativeMethods.LVM_GETHEADER, IntPtr.Zero, IntPtr.Zero);
-            if (header != IntPtr.Zero)
-                NativeMethods.SendMessage(header, NativeMethods.WM_SETFONT, font.ToHfont(), (IntPtr)1);
-        }
-
 
         private Font CreateDefaultReferenceMonoFont()
         {
@@ -716,6 +708,16 @@ namespace PS2Disassembler
                 RebuildLabelCache();
                 _disasmList.Invalidate();
 
+                if (_rows.Count > 0 && _pendingNavAddr != 0)
+                {
+                    uint target = _pendingNavAddr;
+                    _pendingNavAddr = 0;
+                    _pendingNavVisibleOffset = 0;
+                    _pendingNavCenter = false;
+                    if (TryGetRowIndexByAddress(target, out int rowIndex) || ((rowIndex = FindNearestRow(target)) >= 0 && rowIndex < _rows.Count))
+                        SelectRow(rowIndex, center: true);
+                }
+
                 string projectFileName = Path.GetFileName(dlg.FileName);
                 SetActivityStatus($"{projectFileName} opened - {imported:N0} labels imported.");
             }
@@ -940,6 +942,15 @@ namespace PS2Disassembler
 
             if (_objectLabelDefinitions.Count > 0)
                 ApplyObjectLabelDefinitions(_objectLabelDefinitions, showDialogs: false);
+
+            if (fs.Position + 8 <= fs.Length)
+            {
+                br.ReadInt32(); // saved selected row index (kept for compatibility)
+                uint savedSelectedAddress = br.ReadUInt32();
+                _pendingNavAddr = savedSelectedAddress;
+                _pendingNavVisibleOffset = 0;
+                _pendingNavCenter = true;
+            }
 
             return imported;
         }
@@ -1416,6 +1427,7 @@ namespace PS2Disassembler
                 _pineDebugWindow.Show(this);
                 // Apply current theme to the newly opened window
                 ApplyThemeToControlTree(_pineDebugWindow);
+                ApplyScrollbarTheme(_pineDebugWindow, _currentTheme == AppTheme.Dark);
                 ApplyThemeToWindowChrome(_pineDebugWindow, forceFrameRefresh: true);
             }
 
@@ -1425,6 +1437,9 @@ namespace PS2Disassembler
             // Update connection status labels
             _pineDebugWindow.SetPineStatus(_pineAvailable);
             _pineDebugWindow.SetMcpStatus(_debugServerAvailable);
+            ApplyThemeToControlTree(_pineDebugWindow);
+            ApplyScrollbarTheme(_pineDebugWindow, _currentTheme == AppTheme.Dark);
+            ApplyThemeToWindowChrome(_pineDebugWindow, forceFrameRefresh: false);
 
             _pineDebugWindow.BringToFront();
         }
@@ -1469,7 +1484,7 @@ namespace PS2Disassembler
                 uint status = _pine.GetStatusSafe();
                 _pineAvailable = true;
                 _nextPineRetryUtc = DateTime.MinValue;
-                LogPine($"Connected to PINE 127.0.0.1:28011 | Version='{version}' | Title='{title}' | Status={status}");
+                LogPine($"Connected to PINE {_pine.Host}:{_pine.Port} | Version='{version}' | Title='{title}' | Status={status}");
                 UpdatePineDebugWindowStatus();
                 return true;
             }
@@ -1481,6 +1496,30 @@ namespace PS2Disassembler
                 UpdatePineDebugWindowStatus();
                 return false;
             }
+        }
+
+        private void ApplyDebugConnectionSettings()
+        {
+            string host = AppSettings.NormalizeDebugHost(_appSettings?.DebugHost);
+            int pinePort = AppSettings.NormalizePort(_appSettings?.PinePort, AppSettings.DefaultPinePort);
+            int mcpPort = AppSettings.NormalizePort(_appSettings?.McpPort, AppSettings.DefaultMcpPort);
+
+            _pine.Configure(host, pinePort);
+            _debugServer.Configure(host, mcpPort);
+        }
+
+        private void ResetLiveDebugConnectionsAfterEndpointChange()
+        {
+            try { _pine.Disconnect(); } catch { }
+            try { _debugServer.Disconnect(); } catch { }
+
+            _pineAvailable = false;
+            _debugServerAvailable = false;
+            _nextPineRetryUtc = DateTime.MinValue;
+            _nextDebugServerRetryUtc = DateTime.MinValue;
+            _nextDebuggerPollUtc = DateTime.MinValue;
+
+            UpdatePineDebugWindowStatus();
         }
 
         private uint OffsetToPineAddress(int offset)
@@ -1837,13 +1876,6 @@ namespace PS2Disassembler
             _pineAvailable = false;
             _nextPineRetryUtc = DateTime.MinValue;
 
-            // Close PINE debug window
-            if (_pineDebugWindow != null && !_pineDebugWindow.IsDisposed)
-            {
-                try { _pineDebugWindow.Close(); } catch { }
-                _pineDebugWindow = null;
-            }
-
             // Disconnect debug server
             try { _debugServer.Disconnect(); } catch { }
             _debugServerAvailable = false;
@@ -1997,31 +2029,6 @@ namespace PS2Disassembler
             }
         }
 
-        private static bool IsReadableProtection(uint protect)
-        {
-            const uint PAGE_NOACCESS          = 0x01;
-            const uint PAGE_READONLY          = 0x02;
-            const uint PAGE_READWRITE         = 0x04;
-            const uint PAGE_WRITECOPY         = 0x08;
-            const uint PAGE_EXECUTE           = 0x10;
-            const uint PAGE_EXECUTE_READ      = 0x20;
-            const uint PAGE_EXECUTE_READWRITE = 0x40;
-            const uint PAGE_EXECUTE_WRITECOPY = 0x80;
-            const uint PAGE_GUARD             = 0x100;
-
-            if ((protect & PAGE_GUARD) != 0 || (protect & PAGE_NOACCESS) != 0)
-                return false;
-
-            uint baseProt = protect & 0xFF;
-            return baseProt == PAGE_READONLY ||
-                   baseProt == PAGE_READWRITE ||
-                   baseProt == PAGE_WRITECOPY ||
-                   baseProt == PAGE_EXECUTE ||
-                   baseProt == PAGE_EXECUTE_READ ||
-                   baseProt == PAGE_EXECUTE_READWRITE ||
-                   baseProt == PAGE_EXECUTE_WRITECOPY;
-        }
-
         private static bool TryReadRemoteSlice(IntPtr hProc, long remoteAddress, byte[] buffer, int bufferOffset, int length, out int bytesRead)
         {
             bytesRead = 0;
@@ -2103,55 +2110,6 @@ namespace PS2Disassembler
             long eeHostAddr = ResolveEeRamHostAddress(hProc, out errMsg);
             if (eeHostAddr == 0) return null;
             return ReadEeRamFromAddress(hProc, eeHostAddr, out errMsg, null);
-        }
-
-        private bool ReadEeRamVisible(VisibleLiveSnapshot? snapshot = null)
-        {
-            if (_fileData == null)
-                return false;
-
-            if (TryReadVisibleViaPine(snapshot))
-                return true;
-
-            if (_liveProcId == 0 || _eeHostAddr == 0)
-                return false;
-
-            IntPtr hProc = NativeMethods.OpenProcess(
-                NativeMethods.PROCESS_VM_READ | NativeMethods.PROCESS_QUERY_INFO,
-                false, _liveProcId);
-            if (hProc == IntPtr.Zero)
-                return false;
-
-            try
-            {
-                bool anyRead = false;
-                foreach (var (start, length) in GetVisibleReadRanges(snapshot))
-                {
-                    if (length <= 0) continue;
-
-                    if (start < PreservedKernelWindowLength)
-                    {
-                        int suffixStart = Math.Max(start, PreservedKernelWindowLength);
-                        int suffixLength = (start + length) - suffixStart;
-                        if (suffixLength > 0)
-                        {
-                            int read = ReadRemoteReliable(hProc, _eeHostAddr + suffixStart, _fileData, suffixStart, suffixLength);
-                            if (read > 0)
-                                anyRead = true;
-                        }
-                        continue;
-                    }
-
-                    int fullRead = ReadRemoteReliable(hProc, _eeHostAddr + start, _fileData, start, length);
-                    if (fullRead > 0)
-                        anyRead = true;
-                }
-                return anyRead;
-            }
-            finally
-            {
-                NativeMethods.CloseHandle(hProc);
-            }
         }
 
         private VisibleLiveSnapshot CaptureVisibleLiveSnapshot(int disasmPadding = 4)
@@ -2966,15 +2924,6 @@ namespace PS2Disassembler
             }
         }
 
-        private SlimRow CreateInitialRowForWord(uint word, uint address, DisassemblyRow decoded)
-        {
-            if (decoded.Kind != InstructionType.Data)
-                return new SlimRow { Address = address, Word = word, Kind = decoded.Kind, Target = decoded.Target };
-            if (LooksLikeFloatWord(word))
-                return SlimRow.DataRow(address, word, DataKind.Float);
-            return SlimRow.DataRow(address, word, DataKind.Word);
-        }
-
         /// <summary>Zero-allocation variant — takes pre-computed Kind/Target from DecodeKindAndTarget.</summary>
         private SlimRow CreateInitialRowForKind(uint word, uint address, InstructionType kind, uint target)
         {
@@ -3003,21 +2952,6 @@ namespace PS2Disassembler
 
         private static bool IsWholeWordByteRow(SlimRow row)
             => row.DataSub == DataKind.Byte && (row.Address & 3u) == 0;
-
-        private static string FormatByteRowValue(uint word)
-        {
-            var parts = new List<string>(4);
-            for (int i = 0; i < 4; i++)
-            {
-                byte value = (byte)(word >> (i * 8));
-                if (value == 0x00)
-                    break;
-                parts.Add(FormatByteValue(value));
-            }
-
-            return parts.Count == 0 ? FormatByteValue(0x00) : string.Join(" ", parts);
-        }
-
 
         private static Dictionary<uint, int> BuildStringRanges(byte[] data, uint baseAddr, uint startOff, uint endOff, IReadOnlyDictionary<uint, string> stringLabels)
         {
@@ -3124,38 +3058,6 @@ namespace PS2Disassembler
 
                 while (rowIdx < rows.Count && (int)(rows[rowIdx].Address - baseAddr) < consumeUntil)
                     rowIdx++;
-            }
-
-            return expanded;
-        }
-
-        private static List<SlimRow> ExpandWholeWordByteRows(List<SlimRow> rows, byte[] data, uint baseAddr, uint startOff, uint endOff)
-        {
-            if (rows.Count == 0 || data.Length == 0)
-                return rows;
-
-            var expanded = new List<SlimRow>(rows.Count);
-            foreach (var row in rows)
-            {
-                if (!IsWholeWordByteRow(row))
-                {
-                    expanded.Add(row);
-                    continue;
-                }
-
-                uint aligned = row.Address & ~3u;
-                long off = (long)(aligned - baseAddr);
-                if (off < startOff || off < 0 || off + 4 > endOff || off + 4 > data.Length)
-                {
-                    expanded.Add(row);
-                    continue;
-                }
-
-                for (int i = 0; i < 4; i++)
-                {
-                    byte value = data[(int)off + i];
-                    expanded.Add(SlimRow.DataRow(aligned + (uint)i, value, DataKind.Byte, row.Target));
-                }
             }
 
             return expanded;

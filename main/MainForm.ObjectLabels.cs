@@ -658,7 +658,7 @@ namespace PS2Disassembler
                 _search.Width = Math.Max(120, _countLabel.Left - _search.Left - 8);
             };
 
-            _cbLabelsOnly = new CheckBox
+            _cbLabelsOnly = new MainForm.ThemedCheckBox
             {
                 Text = "Labels Only",
                 AutoSize = true,

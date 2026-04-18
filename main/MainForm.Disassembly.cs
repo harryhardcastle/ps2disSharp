@@ -254,31 +254,6 @@ namespace PS2Disassembler
             return false;
         }
 
-        private bool TryFindPriorLuiValue(int rowIdx, uint reg, out uint upper)
-        {
-            upper = 0;
-            if (reg == 0) return false;
-
-            for (int i = rowIdx; i >= Math.Max(0, rowIdx - 16); i--)
-            {
-                uint w = _rows[i].Word;
-                uint op = (w >> 26) & 0x3F;
-                uint rt = (w >> 16) & 0x1F;
-                uint ui = w & 0xFFFF;
-
-                if (op == 0x0F && rt == reg)
-                {
-                    upper = ui << 16;
-                    return true;
-                }
-
-                if (WritesRegister(w, reg))
-                    return false;
-            }
-
-            return false;
-        }
-
         private string GetHexCellText(int rowIndex, int columnIndex)
         {
             if (_fileData == null || rowIndex < 0)
@@ -331,6 +306,9 @@ namespace PS2Disassembler
 
         private void GoToMemoryViewAddress(uint addr)
         {
+            if (!(_appSettings?.ShowMemoryView ?? AppSettings.DefaultShowMemoryView))
+                return;
+
             if (_mainTabs != null && _mainTabs.Pages.Count > 1)
                 _mainTabs.SelectedIndex = 1;
             AdjustHexSplitter();
@@ -778,7 +756,7 @@ namespace PS2Disassembler
         {
             var r    = GetLiveDisplayRow(e.ItemIndex);
             var item = new ListViewItem(r.Address.ToString("X8"));
-            if (_showHex)   item.SubItems.Add(r.HexWord);
+            if (_showHex)   item.SubItems.Add(GetDisplayHexText(r));
             if (_showBytes) item.SubItems.Add(r.BytesStr);
 
             string command = GetCommandText(r, e.ItemIndex).Replace(AnnotationSentinel.ToString(), string.Empty);
@@ -859,8 +837,8 @@ namespace PS2Disassembler
                 string arrow = delta >= 0 ? "▼" : "▲";
                 string deltaText = delta >= 0 ? $"+{delta}{arrow}" : $"{delta}{arrow}";
                 return string.IsNullOrWhiteSpace(label)
-                    ? $"{baseText} ({deltaText})"
-                    : $"{baseText} ({deltaText}){AnnotationSentinel} {label}";
+                    ? $"{baseText}{AnnotationSentinel} ({deltaText})"
+                    : $"{baseText}{AnnotationSentinel} ({deltaText}) {label}";
             }
 
             return string.IsNullOrWhiteSpace(label) ? baseText : $"{baseText}{AnnotationSentinel} {label}";
@@ -1222,15 +1200,15 @@ namespace PS2Disassembler
                 || prefix.Contains("0x", StringComparison.OrdinalIgnoreCase);
         }
 
-
-        private void DrawDisasmSubItem(object? s, DrawListViewSubItemEventArgs e)
-        {
-            DrawDisasmCellCore(e.Graphics, e.Bounds, e.ItemIndex, e.ColumnIndex, e.SubItem?.Text ?? string.Empty);
-        }
-
         private void DrawDisasmCell(object? s, VirtualDisasmList.VirtualCellPaintEventArgs e)
         {
             DrawDisasmCellCore(e.Graphics, e.Bounds, e.ItemIndex, e.ColumnIndex, GetVirtualDisasmCellText(e.ItemIndex, e.ColumnIndex));
+        }
+
+        private string GetDisplayHexText(DisassemblyRow row)
+        {
+            string hex = row.HexWord;
+            return HasOriginalOpcodeForAddress(row.Address) ? hex + "*" : hex;
         }
 
         private string GetVirtualDisasmCellText(int rowIndex, int columnIndex)
@@ -1254,7 +1232,7 @@ namespace PS2Disassembler
             int c = 1;
             if (_showHex)
             {
-                if (columnIndex == c) return r.HexWord;
+                if (columnIndex == c) return GetDisplayHexText(r);
                 c++;
             }
             if (_showBytes)
@@ -1591,14 +1569,6 @@ namespace PS2Disassembler
             _sbAddr.Text = r.Address.ToString("X8");
             if (syncHex) SyncHexToAddr(r.Address);
             _asciiBytesBar?.Invalidate();
-        }
-
-        private void RedrawRange(int start, int end)
-        {
-            if (start < 0 || end < start) return;
-            start = Math.Max(0, start);
-            end   = Math.Min(_rows.Count - 1, end);
-            if (start <= end) _disasmList.RedrawItems(start, end, true);
         }
 
         private int GetSelectedVisibleRowOffset()
@@ -1956,46 +1926,6 @@ namespace PS2Disassembler
                 : baseValue + (uint)si;
         }
 
-        private bool TryResolveAddressFromSelectedSequence(int rowIdx, out uint address)
-        {
-            address = 0;
-            if (rowIdx < 0 || rowIdx >= _rows.Count)
-                return false;
-
-            uint w = _rows[rowIdx].Word;
-            uint op = (w >> 26) & 0x3F;
-            uint rs = (w >> 21) & 0x1F;
-            uint rt = (w >> 16) & 0x1F;
-            int si = (short)(w & 0xFFFF);
-            uint ui = w & 0xFFFF;
-
-            if (IsLoadStore(op) && rs != 0)
-            {
-                uint baseValue = ResolveRegisterAddressValue(rowIdx, rs);
-                if (baseValue != 0)
-                {
-                    address = baseValue + (uint)si;
-                    return true;
-                }
-                return false;
-            }
-
-            if (op == 0x0F && rt != 0)
-                return TryResolveAddressFromBuilderForwardTrace(rowIdx, rt, ui << 16, out address);
-
-            if (op is 0x08 or 0x09 or 0x0D)
-            {
-                uint baseValue = rs == 0 ? 0 : ResolveRegisterAddressValue(rowIdx, rs);
-                if (baseValue == 0)
-                    return false;
-
-                uint candidate = op == 0x0D ? (baseValue | ui) : (baseValue + (uint)si);
-                return TryResolveAddressFromBuilderForwardTrace(rowIdx, rt, candidate, out address);
-            }
-
-            return false;
-        }
-
         private bool TryResolveAddressFromBuilderForwardTrace(int rowIdx, uint trackedReg, uint trackedValue, out uint address)
         {
             address = 0;
@@ -2107,10 +2037,40 @@ namespace PS2Disassembler
         {
             if (e.Alt && e.KeyCode == Keys.A) { RunXrefAnalyzer(); e.Handled = e.SuppressKeyPress = true; return; }
             // Handle Space + F3 at form level so KeyPreview catches them before the ListView's Win32 internals
-            if (!e.Control && !e.Alt && e.KeyCode == Keys.Space && _disasmList.ContainsFocus)
+            if (!e.Control && !e.Alt && !e.Shift && e.KeyCode == Keys.Space && _disasmList.ContainsFocus)
                 { SetXrefTarget(); e.Handled = e.SuppressKeyPress = true; return; }
-            if (!e.Control && !e.Alt && e.KeyCode == Keys.F3)
+            if (!e.Control && !e.Alt && !e.Shift && e.KeyCode == Keys.F3)
                 { GotoNextXref(); e.Handled = e.SuppressKeyPress = true; return; }
+            if (!e.Control && !e.Alt && !e.Shift && e.KeyCode == Keys.O)
+            {
+                var focused = FindFocusedLeafControl(this);
+                if (focused is not RichTextBox and not TextBox and not ComboBox)
+                {
+                    ShowOptionsDialog();
+                    e.Handled = e.SuppressKeyPress = true;
+                    return;
+                }
+            }
+            if (!e.Control && !e.Alt && !e.Shift && e.KeyCode == Keys.M && IsLiveAttached())
+            {
+                var focused = FindFocusedLeafControl(this);
+                if (focused is not RichTextBox and not TextBox and not ComboBox)
+                {
+                    ShowAccessMonitorWindow();
+                    e.Handled = e.SuppressKeyPress = true;
+                    return;
+                }
+            }
+            if (!e.Control && !e.Alt && !e.Shift && e.KeyCode == Keys.P && !IsLiveAttached())
+            {
+                var focused = FindFocusedLeafControl(this);
+                if (focused is not RichTextBox and not TextBox and not ComboBox)
+                {
+                    AttachToPcsx2();
+                    e.Handled = e.SuppressKeyPress = true;
+                    return;
+                }
+            }
             if (!e.Control) return;
             switch (e.KeyCode)
             {
@@ -2843,7 +2803,7 @@ namespace PS2Disassembler
             ApplyThemeToWindowChrome(_findDialog, forceFrameRefresh: true);
         }
 
-        private void OnFindNext(object? sender, EventArgs e)
+        private async void OnFindNext(object? sender, EventArgs e)
         {
             if (_findDialog == null || _rows.Count == 0) return;
 
@@ -2857,74 +2817,212 @@ namespace PS2Disassembler
             int start = (_selRow + 1) % Math.Max(1, _rows.Count);
             int count = wrapAround ? _rows.Count : Math.Max(0, _rows.Count - start);
 
-            if (mode == FindMode.HexPattern)
+            try
             {
-                var patterns = ParseHexPatternCandidates(query);
-                if (patterns.Count == 0)
-                { MessageBox.Show("Invalid hex pattern.", "Find", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
-                if (_fileData != null)
-                {
-                    int startOffset = start < _rows.Count ? (int)(_rows[start].Address - _baseAddr) : 0;
-                    int bestHitOffset = -1;
-                    int bestDistance = int.MaxValue;
-                    for (int patternIndex = 0; patternIndex < patterns.Count; patternIndex++)
-                    {
-                        int hitOffset = FindHexPatternInData(_fileData, patterns[patternIndex], startOffset, wrapAround);
-                        if (hitOffset < 0)
-                            continue;
+                UseWaitCursor = true;
+                if (_findDialog != null && !_findDialog.IsDisposed)
+                    _findDialog.UseWaitCursor = true;
 
-                        int distance = ComputeForwardPatternDistance(_fileData.Length, startOffset, hitOffset, wrapAround);
-                        if (distance < bestDistance)
+                if (mode == FindMode.HexPattern)
+                {
+                    var patterns = ParseHexPatternCandidates(query);
+                    if (patterns.Count == 0)
+                    {
+                        MessageBox.Show("Invalid hex pattern.", "Find", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+
+                    var (searchData, searchBaseAddr, searchError) = await Task.Run(ReadFindSearchDataSnapshot);
+                    if (!string.IsNullOrEmpty(searchError))
+                    {
+                        MessageBox.Show(searchError, "Find", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+
+                    if (searchData != null && searchData.Length > 0)
+                    {
+                        int startOffset = start < _rows.Count ? (int)(_rows[start].Address - searchBaseAddr) : 0;
+                        int bestHitOffset = await Task.Run(() =>
                         {
-                            bestDistance = distance;
-                            bestHitOffset = hitOffset;
+                            int localBestHitOffset = -1;
+                            int localBestDistance = int.MaxValue;
+                            for (int patternIndex = 0; patternIndex < patterns.Count; patternIndex++)
+                            {
+                                int hitOffset = FindHexPatternInData(searchData, patterns[patternIndex], startOffset, wrapAround);
+                                if (hitOffset < 0)
+                                    continue;
+
+                                int distance = ComputeForwardPatternDistance(searchData.Length, startOffset, hitOffset, wrapAround);
+                                if (distance < localBestDistance)
+                                {
+                                    localBestDistance = distance;
+                                    localBestHitOffset = hitOffset;
+                                }
+                            }
+                            return localBestHitOffset;
+                        });
+
+                        if (bestHitOffset >= 0)
+                        {
+                            uint hitAddr = searchBaseAddr + (uint)bestHitOffset;
+                            if (TryGetRowIndexByAddress(hitAddr, out int idx) || ((idx = FindNearestRow(hitAddr)) >= 0))
+                            {
+                                SelectRow(idx, center: true);
+                                return;
+                            }
                         }
                     }
 
-                    if (bestHitOffset >= 0)
+                    MessageBox.Show("Hex pattern not found.", "Find", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                var (stringSearchData, stringSearchBaseAddr, stringSearchError) = await Task.Run(ReadFindSearchDataSnapshot);
+                if (!string.IsNullOrEmpty(stringSearchError))
+                {
+                    MessageBox.Show(stringSearchError, "Find", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                if (stringSearchData != null && stringSearchData.Length > 0)
+                {
+                    byte[] queryBytes = Encoding.UTF8.GetBytes(query);
+                    if (queryBytes.Length > 0)
                     {
-                        uint hitAddr = _baseAddr + (uint)bestHitOffset;
-                        if (TryGetRowIndexByAddress(hitAddr, out int idx) || ((idx = FindNearestRow(hitAddr)) >= 0))
+                        int startOffset = start < _rows.Count ? (int)(_rows[start].Address - stringSearchBaseAddr) : 0;
+                        int hitOffset = await Task.Run(() => FindStringInData(stringSearchData, queryBytes, startOffset, wrapAround, caseSensitive));
+                        if (hitOffset >= 0)
+                        {
+                            uint hitAddr = stringSearchBaseAddr + (uint)hitOffset;
+                            if (TryGetRowIndexByAddress(hitAddr, out int idx) || ((idx = FindNearestRow(hitAddr)) >= 0))
+                            {
+                                SelectRow(idx, center: true);
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                // String search — check cheap fields first, avoid expensive GetCommandText
+                StringComparison cmp = caseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+                var disasm = GetCachedDisasm();
+                for (int i = 0; i < count; i++)
+                {
+                    int idx = (start + i) % _rows.Count;
+                    var sr = _rows[idx];
+
+                    // 1. Address (trivial)
+                    string addr = sr.Address.ToString("X8");
+                    if (addr.Contains(query, cmp))
+                    { SelectRow(idx, center: true); return; }
+
+                    // 2. Hex word (trivial)
+                    string hexWord = sr.Word.ToString("X8");
+                    if (hexWord.Contains(query, cmp))
+                    { SelectRow(idx, center: true); return; }
+
+                    // 3. Label (dictionary lookup — cheap)
+                    string? label = GetLabelAt(sr.Address);
+                    if (label != null && label.Contains(query, cmp))
+                    { SelectRow(idx, center: true); return; }
+
+                    // 4. Mnemonic + operands (lightweight disassembly, no ComputeDataAddress)
+                    if (sr.DataSub == DataKind.None && sr.Kind != InstructionType.Data)
+                    {
+                        var dr = disasm.DisassembleSingleWord(sr.Word, sr.Address);
+                        if ((!string.IsNullOrEmpty(dr.Mnemonic) && dr.Mnemonic.Contains(query, cmp)) ||
+                            (!string.IsNullOrEmpty(dr.Operands) && dr.Operands.Contains(query, cmp)))
                         { SelectRow(idx, center: true); return; }
                     }
                 }
-                MessageBox.Show("Hex pattern not found.", "Find", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
 
-            // String search — check cheap fields first, avoid expensive GetCommandText
-            StringComparison cmp = caseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
-            var disasm = GetCachedDisasm();
-            for (int i = 0; i < count; i++)
+                MessageBox.Show($"\"{query}\" not found.", "Find", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            finally
             {
-                int idx = (start + i) % _rows.Count;
-                var sr = _rows[idx];
-
-                // 1. Address (trivial)
-                string addr = sr.Address.ToString("X8");
-                if (addr.Contains(query, cmp))
-                { SelectRow(idx, center: true); return; }
-
-                // 2. Hex word (trivial)
-                string hexWord = sr.Word.ToString("X8");
-                if (hexWord.Contains(query, cmp))
-                { SelectRow(idx, center: true); return; }
-
-                // 3. Label (dictionary lookup — cheap)
-                string? label = GetLabelAt(sr.Address);
-                if (label != null && label.Contains(query, cmp))
-                { SelectRow(idx, center: true); return; }
-
-                // 4. Mnemonic + operands (lightweight disassembly, no ComputeDataAddress)
-                if (sr.DataSub == DataKind.None && sr.Kind != InstructionType.Data)
-                {
-                    var dr = disasm.DisassembleSingleWord(sr.Word, sr.Address);
-                    if ((!string.IsNullOrEmpty(dr.Mnemonic) && dr.Mnemonic.Contains(query, cmp)) ||
-                        (!string.IsNullOrEmpty(dr.Operands) && dr.Operands.Contains(query, cmp)))
-                    { SelectRow(idx, center: true); return; }
-                }
+                UseWaitCursor = false;
+                if (_findDialog != null && !_findDialog.IsDisposed)
+                    _findDialog.UseWaitCursor = false;
             }
-            MessageBox.Show($"\"{query}\" not found.", "Find", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private (byte[]? Data, uint BaseAddress, string? Error) ReadFindSearchDataSnapshot()
+        {
+            uint baseAddress = _baseAddr;
+
+            if (_fileData == null || _fileData.Length == 0)
+                return (null, baseAddress, "No loaded memory data to search.");
+
+            if (!IsLiveAttached())
+                return (_fileData, baseAddress, null);
+
+            var validNames = new[] { "pcsx2", "pcsx2-qt" };
+            var proc = Process.GetProcesses()
+                .FirstOrDefault(p => validNames.Any(name => string.Equals(p.ProcessName, name, StringComparison.OrdinalIgnoreCase)));
+            if (proc == null)
+                return (_fileData, baseAddress, null);
+
+            uint access = NativeMethods.PROCESS_VM_READ | NativeMethods.PROCESS_QUERY_INFO;
+            IntPtr hProc = NativeMethods.OpenProcess(access, false, (uint)proc.Id);
+            if (hProc == IntPtr.Zero)
+                return (_fileData, baseAddress, null);
+
+            try
+            {
+                var ram = ReadEeRamViaSymbol(hProc, out string? err);
+                if (ram != null && ram.Length > 0)
+                    return (ram, 0u, null);
+                return (_fileData, baseAddress, err);
+            }
+            finally
+            {
+                NativeMethods.CloseHandle(hProc);
+            }
+        }
+
+        private static int FindStringInData(byte[] data, byte[] pattern, int startOffset, bool wrap, bool caseSensitive)
+        {
+            if (data == null || pattern == null || pattern.Length == 0 || data.Length < pattern.Length)
+                return -1;
+
+            startOffset = Math.Clamp(startOffset, 0, Math.Max(0, data.Length - 1));
+            int limit = data.Length - pattern.Length;
+            if (limit < 0)
+                return -1;
+
+            bool MatchesAt(int index)
+            {
+                for (int i = 0; i < pattern.Length; i++)
+                {
+                    byte a = data[index + i];
+                    byte b = pattern[i];
+                    if (caseSensitive)
+                    {
+                        if (a != b) return false;
+                    }
+                    else
+                    {
+                        if (a >= (byte)'A' && a <= (byte)'Z') a = (byte)(a + 0x20);
+                        if (b >= (byte)'A' && b <= (byte)'Z') b = (byte)(b + 0x20);
+                        if (a != b) return false;
+                    }
+                }
+                return true;
+            }
+
+            for (int i = startOffset; i <= limit; i++)
+                if (MatchesAt(i))
+                    return i;
+
+            if (wrap)
+            {
+                int wrapLimit = Math.Min(startOffset - 1, limit);
+                for (int i = 0; i <= wrapLimit; i++)
+                    if (MatchesAt(i))
+                        return i;
+            }
+
+            return -1;
         }
 
         private static List<byte[]> ParseHexPatternCandidates(string hex)

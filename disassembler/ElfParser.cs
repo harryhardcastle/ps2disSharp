@@ -55,8 +55,6 @@ namespace PS2Disassembler
     /// </summary>
     public static class ElfParser
     {
-        private const uint ELF_MAGIC = 0x464C457F; // "\x7FELF"
-
         public static bool IsElf(byte[] data)
         {
             if (data.Length < 4) return false;

@@ -7,14 +7,18 @@ namespace PS2Disassembler
     internal sealed class AppSettings
     {
         // Application version — increment by 0.0.001 whenever packaging the source into a zip
-        public const string AppVersion = "0.0.050";
+        public const string AppVersion = "0.0.068";
 
         // Defaults
         public const string DefaultFontFamily = "Liberation Mono";
         public const float DefaultFontSize = 9f;
         public const string DefaultTheme = "Dark";
-        public const int DefaultRefreshRate = 60;
-        public const int DefaultConstantWriteRate = 10;
+        public const int DefaultRefreshRate = 30;
+        public const int DefaultConstantWriteRate = 1;
+        public const string DefaultDebugHost = "127.0.0.1";
+        public const int DefaultPinePort = 28011;
+        public const int DefaultMcpPort = 21512;
+        public const bool DefaultShowMemoryView = true;
         public static readonly int[] SupportedRefreshRates = { 1, 10, 20, 30, 60, 100 };
         public static readonly int[] SupportedConstantWriteRates = { 1, 10, 20, 30, 60 };
 
@@ -23,6 +27,10 @@ namespace PS2Disassembler
         public string Theme { get; set; } = DefaultTheme;
         public int RefreshRate { get; set; } = DefaultRefreshRate;
         public int ConstantWriteRate { get; set; } = DefaultConstantWriteRate;
+        public string DebugHost { get; set; } = DefaultDebugHost;
+        public int PinePort { get; set; } = DefaultPinePort;
+        public int McpPort { get; set; } = DefaultMcpPort;
+        public bool ShowMemoryView { get; set; } = DefaultShowMemoryView;
 
         private static string ConfigPath =>
             Path.Combine(AppContext.BaseDirectory, "ps2dis_settings.json");
@@ -68,6 +76,10 @@ namespace PS2Disassembler
             Theme = DefaultTheme;
             RefreshRate = DefaultRefreshRate;
             ConstantWriteRate = DefaultConstantWriteRate;
+            DebugHost = DefaultDebugHost;
+            PinePort = DefaultPinePort;
+            McpPort = DefaultMcpPort;
+            ShowMemoryView = DefaultShowMemoryView;
         }
 
         private string ToJson()
@@ -78,7 +90,11 @@ namespace PS2Disassembler
             sb.AppendLine($"  \"FontSize\": {FontSize:F1},");
             sb.AppendLine($"  \"Theme\": \"{EscapeJsonString(Theme)}\",");
             sb.AppendLine($"  \"RefreshRate\": {RefreshRate},");
-            sb.AppendLine($"  \"ConstantWriteRate\": {ConstantWriteRate}");
+            sb.AppendLine($"  \"ConstantWriteRate\": {ConstantWriteRate},");
+            sb.AppendLine($"  \"DebugHost\": \"{EscapeJsonString(NormalizeDebugHost(DebugHost))}\",");
+            sb.AppendLine($"  \"PinePort\": {NormalizePort(PinePort, DefaultPinePort)},");
+            sb.AppendLine($"  \"McpPort\": {NormalizePort(McpPort, DefaultMcpPort)},");
+            sb.AppendLine($"  \"ShowMemoryView\": {(ShowMemoryView ? "true" : "false")}");
             sb.AppendLine("}");
             return sb.ToString();
         }
@@ -109,6 +125,18 @@ namespace PS2Disassembler
             int? constantWriteRate = ExtractIntValue(json, "ConstantWriteRate");
             if (constantWriteRate.HasValue && IsSupportedConstantWriteRate(constantWriteRate.Value))
                 settings.ConstantWriteRate = constantWriteRate.Value;
+
+            string? debugHost = ExtractStringValue(json, "DebugHost");
+            settings.DebugHost = NormalizeDebugHost(debugHost);
+
+            int? pinePort = ExtractIntValue(json, "PinePort");
+            settings.PinePort = NormalizePort(pinePort, DefaultPinePort);
+
+            int? mcpPort = ExtractIntValue(json, "McpPort");
+            settings.McpPort = NormalizePort(mcpPort, DefaultMcpPort);
+
+            bool? showMemoryView = ExtractBoolValue(json, "ShowMemoryView");
+            settings.ShowMemoryView = showMemoryView ?? DefaultShowMemoryView;
 
             return settings;
         }
@@ -150,6 +178,41 @@ namespace PS2Disassembler
                     return true;
             }
             return false;
+        }
+
+        public static string NormalizeDebugHost(string? host)
+        {
+            if (string.IsNullOrWhiteSpace(host))
+                return DefaultDebugHost;
+
+            string trimmed = host.Trim();
+            return trimmed.Length == 0 ? DefaultDebugHost : trimmed;
+        }
+
+        public static int NormalizePort(int? port, int fallback)
+        {
+            return port.HasValue && port.Value >= 1 && port.Value <= 65535 ? port.Value : fallback;
+        }
+
+        private static bool? ExtractBoolValue(string json, string key)
+        {
+            string pattern = $"\"{key}\"";
+            int idx = json.IndexOf(pattern, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) return null;
+
+            int colonIdx = json.IndexOf(':', idx + pattern.Length);
+            if (colonIdx < 0) return null;
+
+            int start = colonIdx + 1;
+            while (start < json.Length && char.IsWhiteSpace(json[start]))
+                start++;
+
+            if (start + 4 <= json.Length && string.Compare(json, start, "true", 0, 4, StringComparison.OrdinalIgnoreCase) == 0)
+                return true;
+            if (start + 5 <= json.Length && string.Compare(json, start, "false", 0, 5, StringComparison.OrdinalIgnoreCase) == 0)
+                return false;
+
+            return null;
         }
 
         private static int? ExtractIntValue(string json, string key)

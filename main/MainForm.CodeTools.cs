@@ -113,15 +113,6 @@ namespace PS2Disassembler
             return tp.Controls.Count > 0 ? tp.Controls[0] as Panel : null;
         }
 
-        private CodeToolsDialog OpenCodeTools()
-        {
-            var dlg = EnsureCodeToolsDialog();
-            // Switch to the Code Manager tab instead of showing a floating window
-            if (_mainTabs != null && _mainTabs.Pages.Count >= 3)
-                _mainTabs.SelectedIndex = 2;
-            return dlg;
-        }
-
         private void PatchFileDataAndRows(IReadOnlyList<(uint Addr, byte[] Bytes)> patches)
         {
             if (_fileData == null || patches.Count == 0) return;
@@ -628,16 +619,45 @@ namespace PS2Disassembler
         {
             var r   = _rows[row];
             var eng = GetCachedDisasm();
+            var displayRow = ResolveRowForDisplay(r);
 
             int hexCol   = _showHex   ? 1 : -1;
             int bytesCol = _showBytes ? (_showHex ? 2 : 1) : -1;
 
             if (col == hexCol)
             {
+                if (displayRow.Mnemonic == ".byte")
+                {
+                    if (!TryParseMaskedInlineByteValue(text, out uint byteValue))
+                        return false;
+
+                    if ((r.Word & 0xFFu) != (byteValue & 0xFFu))
+                        ApplyTypedDisassemblyValueChange(row, byteValue);
+                    return true;
+                }
+
+                if (displayRow.Mnemonic == ".half")
+                {
+                    if (!TryParseMaskedInlineHalfValue(text, out uint halfValue))
+                        return false;
+
+                    if ((r.Word & 0xFFFFu) != (halfValue & 0xFFFFu))
+                        ApplyTypedDisassemblyValueChange(row, halfValue);
+                    return true;
+                }
+
                 string h = text.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? text[2..] : text;
                 if (!uint.TryParse(h, System.Globalization.NumberStyles.HexNumber, null, out uint w))
                     return false;
-                if (w != r.Word) CommitWordChange(row, w, r.Address, eng);
+
+                uint compareWord = displayRow.Mnemonic is ".word" or ".float" ? GetInlineEditBackingWord(r) : r.Word;
+                if (w != compareWord)
+                {
+                    if (displayRow.Mnemonic is ".word" or ".float")
+                        ApplyTypedDisassemblyValueChange(row, w);
+                    else
+                        CommitWordChange(row, w, r.Address, eng);
+                }
                 return true;
             }
 
@@ -650,22 +670,57 @@ namespace PS2Disassembler
                     if (!byte.TryParse(parts[i], System.Globalization.NumberStyles.HexNumber, null, out bs[i]))
                         return false;
                 uint w = (uint)(bs[0] | (bs[1] << 8) | (bs[2] << 16) | (bs[3] << 24));
-                if (w != r.Word) CommitWordChange(row, w, r.Address, eng);
+                uint compareWord = r.DataSub != DataKind.None ? GetInlineEditBackingWord(r) : r.Word;
+                if (w != compareWord)
+                {
+                    if (r.DataSub != DataKind.None)
+                        CommitWordChangePreserveDisplayType(row, w, r.Address, eng, displayRow.Mnemonic);
+                    else
+                        CommitWordChange(row, w, r.Address, eng);
+                }
                 return true;
             }
 
             if (col == CmdCol)
             {
-                var displayRow = ResolveRowForDisplay(r);
-                uint? w = displayRow.Mnemonic switch
+                if (displayRow.Mnemonic == ".float")
                 {
-                    ".float" when float.TryParse(text, System.Globalization.NumberStyles.Float | System.Globalization.NumberStyles.AllowThousands, System.Globalization.CultureInfo.InvariantCulture, out float fv)
-                        => unchecked((uint)BitConverter.SingleToInt32Bits(fv)),
-                    ".word" => TryParseInlineWordValue(text, out uint wordValue) ? wordValue : null,
-                    ".half" => TryParseInlineHalfValue(text, out uint halfValue) ? ((r.Word & 0xFFFF0000u) | halfValue) : null,
-                    ".byte" => TryParseInlineByteValue(text, out uint byteValue) ? ((r.Word & 0xFFFFFF00u) | byteValue) : null,
-                    _ => MipsAssembler.Assemble(text, r.Address),
-                };
+                    if (!float.TryParse(text, System.Globalization.NumberStyles.Float | System.Globalization.NumberStyles.AllowThousands, System.Globalization.CultureInfo.InvariantCulture, out float fv))
+                        return false;
+                    uint newValue = unchecked((uint)BitConverter.SingleToInt32Bits(fv));
+                    if (newValue != GetInlineEditBackingWord(r))
+                        ApplyTypedDisassemblyValueChange(row, newValue);
+                    return true;
+                }
+
+                if (displayRow.Mnemonic == ".word")
+                {
+                    if (!TryParseInlineWordValue(text, out uint wordValue))
+                        return false;
+                    if (wordValue != GetInlineEditBackingWord(r))
+                        ApplyTypedDisassemblyValueChange(row, wordValue);
+                    return true;
+                }
+
+                if (displayRow.Mnemonic == ".half")
+                {
+                    if (!TryParseInlineHalfValue(text, out uint halfValue))
+                        return false;
+                    if ((r.Word & 0xFFFFu) != (halfValue & 0xFFFFu))
+                        ApplyTypedDisassemblyValueChange(row, halfValue);
+                    return true;
+                }
+
+                if (displayRow.Mnemonic == ".byte")
+                {
+                    if (!TryParseInlineByteValue(text, out uint byteValue))
+                        return false;
+                    if ((r.Word & 0xFFu) != (byteValue & 0xFFu))
+                        ApplyTypedDisassemblyValueChange(row, byteValue);
+                    return true;
+                }
+
+                uint? w = MipsAssembler.Assemble(text, r.Address);
                 if (!w.HasValue) return false;
                 if (w.Value != r.Word) CommitWordChangePreserveDisplayType(row, w.Value, r.Address, eng, displayRow.Mnemonic);
                 return true;
@@ -719,6 +774,76 @@ namespace PS2Disassembler
                 value = b;
                 return true;
             }
+            value = 0;
+            return false;
+        }
+
+
+        private uint GetInlineEditBackingWord(SlimRow row)
+        {
+            uint aligned = row.Address & ~3u;
+            if (TryReadWordAt(aligned, out uint word))
+                return word;
+
+            return row.DataSub switch
+            {
+                DataKind.Byte => (row.Word & 0xFFu) << (((int)(row.Address & 3u)) * 8),
+                DataKind.Half => (row.Word & 0xFFFFu) << (((int)(row.Address & 2u)) * 8),
+                _ => row.Word,
+            };
+        }
+
+        private static string ExtractInlineHexDigits(string text)
+        {
+            text = text.Trim();
+            int paren = text.IndexOf('(');
+            if (paren >= 0) text = text[..paren].Trim();
+            if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                text = text[2..];
+
+            var sb = new StringBuilder(text.Length);
+            foreach (char ch in text)
+            {
+                if (Uri.IsHexDigit(ch))
+                    sb.Append(ch);
+            }
+            return sb.ToString();
+        }
+
+        private static bool TryParseMaskedInlineHalfValue(string text, out uint value)
+        {
+            string digits = ExtractInlineHexDigits(text);
+            if (digits.Length == 0 || digits.Length > 4)
+            {
+                value = 0;
+                return false;
+            }
+
+            if (ushort.TryParse(digits, System.Globalization.NumberStyles.HexNumber, null, out ushort half))
+            {
+                value = half;
+                return true;
+            }
+
+            value = 0;
+            return false;
+        }
+
+        private static bool TryParseMaskedInlineByteValue(string text, out uint value)
+        {
+            string digits = ExtractInlineHexDigits(text);
+            if (digits.Length == 0 || digits.Length > 2)
+            {
+                value = 0;
+                return false;
+            }
+
+            if (byte.TryParse(digits, System.Globalization.NumberStyles.HexNumber, null, out byte b))
+            {
+                value = b;
+                return true;
+            }
+
             value = 0;
             return false;
         }
@@ -831,18 +956,6 @@ namespace PS2Disassembler
 
         // ── Helpers ───────────────────────────────────────────────────────
 
-        private static ToolStripButton TbBtn(string tip, string label, Action act)
-        {
-            var btn = new ToolStripButton(label)
-            {
-                ToolTipText  = tip,
-                AutoSize     = true,
-                DisplayStyle = ToolStripItemDisplayStyle.Text,
-                Font         = new Font("Segoe UI Symbol", 10f),
-            };
-            btn.Click += (_, _) => act();
-            return btn;
-        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -931,7 +1044,7 @@ namespace PS2Disassembler
             StartPosition   = FormStartPosition.CenterParent;
             Font            = new Font("Tahoma", 8.25f);
 
-            Controls.Add(new Label { Text = prompt, Location = new Point(12, 12), AutoSize = true });
+            Controls.Add(new Label { Text = prompt, Location = new Point(12, 0), AutoSize = true });
             _tb = new TextBox
             {
                 Text = initial, Location = new Point(12, 34),
@@ -1153,7 +1266,7 @@ namespace PS2Disassembler
                 AutoSize  = true,
             };
 
-            _cbLabelsOnly = new CheckBox
+            _cbLabelsOnly = new MainForm.ThemedCheckBox
             {
                 Text = "Labels Only",
                 AutoSize = true,
@@ -2596,8 +2709,8 @@ namespace PS2Disassembler
 
             _rbString.CheckedChanged += (_, _) => _chkCaseSensitive.Enabled = _rbString.Checked;
 
-            _chkCaseSensitive = new CheckBox { Text = "Case sensitive", Location = new Point(214, 78), AutoSize = true };
-            _chkWrapAround = new CheckBox { Text = "Wrap around", Location = new Point(214, 98), AutoSize = true, Checked = true };
+            _chkCaseSensitive = new MainForm.ThemedCheckBox { Text = "Case sensitive", Location = new Point(214, 78), AutoSize = true };
+            _chkWrapAround = new MainForm.ThemedCheckBox { Text = "Wrap around", Location = new Point(214, 98), AutoSize = true, Checked = true };
             Controls.Add(_chkCaseSensitive);
             Controls.Add(_chkWrapAround);
 
@@ -2635,6 +2748,10 @@ namespace PS2Disassembler
         private readonly MainForm.FlatComboBox _cbTheme;
         private readonly MainForm.FlatComboBox _cbRefreshRate;
         private readonly MainForm.FlatComboBox _cbConstantWriteRate;
+        private readonly CheckBox _chkShowMemoryView;
+        private readonly TextBox _tbDebugHost;
+        private readonly TextBox _tbPinePort;
+        private readonly TextBox _tbMcpPort;
 
         /// <summary>Raised when the user clicks Apply so the caller can read properties and act.</summary>
         public event EventHandler? ApplyRequested;
@@ -2650,11 +2767,16 @@ namespace PS2Disassembler
         public int SelectedConstantWriteRate => int.TryParse(_cbConstantWriteRate.SelectedItem?.ToString(), out int v) && AppSettings.IsSupportedConstantWriteRate(v)
             ? v
             : AppSettings.DefaultConstantWriteRate;
+        public bool SelectedShowMemoryView => _chkShowMemoryView.Checked;
+        public string SelectedDebugHost => AppSettings.NormalizeDebugHost(_tbDebugHost.Text);
+        public int SelectedPinePort => ParsePort(_tbPinePort.Text, AppSettings.DefaultPinePort);
+        public int SelectedMcpPort => ParsePort(_tbMcpPort.Text, AppSettings.DefaultMcpPort);
 
         public OptionsDialog(AppSettings settings, bool dark)
         {
             Text = $"Options - Version {AppSettings.AppVersion}";
-            ClientSize = new Size(390, 250);
+            ClientSize = new Size(354, 248);
+            Tag = "OptionsDialog";
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             MinimizeBox = false;
@@ -2665,23 +2787,29 @@ namespace PS2Disassembler
 
             SuspendLayout();
 
-            const int outerMargin = 16;
-            const int groupWidth = 358;
             const int innerLabelX = 16;
-            const int innerControlX = 140;
-            const int innerControlW = 200;
+            const int innerControlX = 126;
+            const int innerControlW = 172;
             const int rowH = 34;
-            const int topRowY = 28;
+            const int topRowY = 20;
 
-            var grpUi = new GroupBox
+            var tabs = new MainForm.FlatTabHost
             {
-                Text = "UI Settings",
-                Location = new Point(outerMargin, 12),
-                Size = new Size(groupWidth, 136),
+                Location = new Point(0, 0),
+                Size = new Size(ClientSize.Width, 186),
+                TabStop = true,
+                TabStripTopPadding = 0,
+                TabButtonWidth = 118,
+                Margin = new Padding(0),
+                Tag = "OptionsTabHost",
             };
-            grpUi.SuspendLayout();
 
-            grpUi.Controls.Add(new Label { Text = "Font:", Location = new Point(innerLabelX, topRowY + 3), AutoSize = true });
+            var tabUi = new MainForm.FlatTabPage("Interface") { Tag = "OptionsTabPage" };
+            var tabPcsx2 = new MainForm.FlatTabPage("PCSX2") { Tag = "OptionsTabPage" };
+            var tabDebug = new MainForm.FlatTabPage("DEBUG") { Tag = "OptionsTabPage" };
+
+            var pnlUi = new Panel { Dock = DockStyle.Fill, Padding = new Padding(12), Margin = new Padding(0), Tag = "OptionsSurface" };
+            pnlUi.Controls.Add(new Label { Text = "Font:", Location = new Point(innerLabelX, topRowY + 3), AutoSize = true });
             _cbFont = new MainForm.FlatComboBox
             {
                 Location = new Point(innerControlX, topRowY),
@@ -2715,10 +2843,10 @@ namespace PS2Disassembler
                 _cbFont.Items.Insert(0, settings.FontFamily);
             }
             SelectComboItem(_cbFont, settings.FontFamily, AppSettings.DefaultFontFamily);
-            grpUi.Controls.Add(_cbFont);
+            pnlUi.Controls.Add(_cbFont);
 
             int fontSizeRowY = topRowY + rowH;
-            grpUi.Controls.Add(new Label { Text = "Font Size:", Location = new Point(innerLabelX, fontSizeRowY + 3), AutoSize = true });
+            pnlUi.Controls.Add(new Label { Text = "Font Size:", Location = new Point(innerLabelX, fontSizeRowY + 3), AutoSize = true });
             _cbFontSize = new MainForm.FlatComboBox
             {
                 Location = new Point(innerControlX, fontSizeRowY),
@@ -2732,10 +2860,10 @@ namespace PS2Disassembler
             if (sizeText.EndsWith(".0", StringComparison.Ordinal))
                 sizeText = sizeText[..^2];
             SelectComboItem(_cbFontSize, sizeText, AppSettings.DefaultFontSize.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture));
-            grpUi.Controls.Add(_cbFontSize);
+            pnlUi.Controls.Add(_cbFontSize);
 
             int themeRowY = fontSizeRowY + rowH;
-            grpUi.Controls.Add(new Label { Text = "Theme:", Location = new Point(innerLabelX, themeRowY + 3), AutoSize = true });
+            pnlUi.Controls.Add(new Label { Text = "Theme:", Location = new Point(innerLabelX, themeRowY + 3), AutoSize = true });
             _cbTheme = new MainForm.FlatComboBox
             {
                 Location = new Point(innerControlX, themeRowY),
@@ -2745,22 +2873,25 @@ namespace PS2Disassembler
             };
             _cbTheme.Items.AddRange(new object[] { "Dark", "Light" });
             SelectComboItem(_cbTheme, settings.Theme, AppSettings.DefaultTheme);
-            grpUi.Controls.Add(_cbTheme);
-            grpUi.ResumeLayout(false);
-            grpUi.PerformLayout();
-            Controls.Add(grpUi);
+            pnlUi.Controls.Add(_cbTheme);
 
-            var grpPcsx2 = new GroupBox
+            int showMemoryRowY = themeRowY + rowH;
+            _chkShowMemoryView = new MainForm.ThemedCheckBox
             {
-                Text = "PCSX2 Settings",
-                Location = new Point(outerMargin, grpUi.Bottom + 10),
-                Size = new Size(groupWidth, 108),
+                Text = "Show Memory View",
+                Location = new Point(innerLabelX, showMemoryRowY + 2),
+                AutoSize = true,
+                Checked = settings.ShowMemoryView,
+                TabStop = true,
             };
-            grpPcsx2.SuspendLayout();
-            grpPcsx2.Controls.Add(new Label { Text = "Refresh Rate:", Location = new Point(innerLabelX, 31), AutoSize = true });
+            pnlUi.Controls.Add(_chkShowMemoryView);
+            tabUi.Controls.Add(pnlUi);
+
+            var pnlPcsx2 = new Panel { Dock = DockStyle.Fill, Padding = new Padding(12), Margin = new Padding(0), Tag = "OptionsSurface" };
+            pnlPcsx2.Controls.Add(new Label { Text = "Refresh Rate:", Location = new Point(innerLabelX, topRowY + 3), AutoSize = true });
             _cbRefreshRate = new MainForm.FlatComboBox
             {
-                Location = new Point(innerControlX, 28),
+                Location = new Point(innerControlX, topRowY),
                 Width = innerControlW,
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 TabStop = true,
@@ -2770,10 +2901,10 @@ namespace PS2Disassembler
             SelectComboItem(_cbRefreshRate,
                 (AppSettings.IsSupportedRefreshRate(settings.RefreshRate) ? settings.RefreshRate : AppSettings.DefaultRefreshRate).ToString(System.Globalization.CultureInfo.InvariantCulture),
                 AppSettings.DefaultRefreshRate.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            grpPcsx2.Controls.Add(_cbRefreshRate);
+            pnlPcsx2.Controls.Add(_cbRefreshRate);
 
-            int writeRateRowY = 28 + rowH;
-            grpPcsx2.Controls.Add(new Label { Text = "Constant Write Rate:", Location = new Point(innerLabelX, writeRateRowY + 3), AutoSize = true });
+            int writeRateRowY = topRowY + rowH;
+            pnlPcsx2.Controls.Add(new Label { Text = "Constant Write Rate:", Location = new Point(innerLabelX, writeRateRowY + 3), AutoSize = true });
             _cbConstantWriteRate = new MainForm.FlatComboBox
             {
                 Location = new Point(innerControlX, writeRateRowY),
@@ -2786,16 +2917,53 @@ namespace PS2Disassembler
             SelectComboItem(_cbConstantWriteRate,
                 (AppSettings.IsSupportedConstantWriteRate(settings.ConstantWriteRate) ? settings.ConstantWriteRate : AppSettings.DefaultConstantWriteRate).ToString(System.Globalization.CultureInfo.InvariantCulture),
                 AppSettings.DefaultConstantWriteRate.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            grpPcsx2.Controls.Add(_cbConstantWriteRate);
-            grpPcsx2.ResumeLayout(false);
-            grpPcsx2.PerformLayout();
-            Controls.Add(grpPcsx2);
+            pnlPcsx2.Controls.Add(_cbConstantWriteRate);
+            tabPcsx2.Controls.Add(pnlPcsx2);
 
-            int buttonsY = grpPcsx2.Bottom + 10;
+            var pnlDebug = new Panel { Dock = DockStyle.Fill, Padding = new Padding(12), Margin = new Padding(0), Tag = "OptionsSurface" };
+            pnlDebug.Controls.Add(new Label { Text = "Host:", Location = new Point(innerLabelX, topRowY + 3), AutoSize = true });
+            _tbDebugHost = new TextBox
+            {
+                Location = new Point(innerControlX, topRowY),
+                Width = innerControlW,
+                Text = AppSettings.NormalizeDebugHost(settings.DebugHost),
+                TabStop = true,
+            };
+            pnlDebug.Controls.Add(_tbDebugHost);
+
+            int pinePortRowY = topRowY + rowH;
+            pnlDebug.Controls.Add(new Label { Text = "PINE Port:", Location = new Point(innerLabelX, pinePortRowY + 3), AutoSize = true });
+            _tbPinePort = new TextBox
+            {
+                Location = new Point(innerControlX, pinePortRowY),
+                Width = innerControlW,
+                Text = AppSettings.NormalizePort(settings.PinePort, AppSettings.DefaultPinePort).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                TabStop = true,
+            };
+            pnlDebug.Controls.Add(_tbPinePort);
+
+            int mcpPortRowY = pinePortRowY + rowH;
+            pnlDebug.Controls.Add(new Label { Text = "MCP Port:", Location = new Point(innerLabelX, mcpPortRowY + 3), AutoSize = true });
+            _tbMcpPort = new TextBox
+            {
+                Location = new Point(innerControlX, mcpPortRowY),
+                Width = innerControlW,
+                Text = AppSettings.NormalizePort(settings.McpPort, AppSettings.DefaultMcpPort).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                TabStop = true,
+            };
+            pnlDebug.Controls.Add(_tbMcpPort);
+            tabDebug.Controls.Add(pnlDebug);
+
+            tabs.AddPage(tabUi);
+            tabs.AddPage(tabPcsx2);
+            tabs.AddPage(tabDebug);
+            Controls.Add(tabs);
+
+            int buttonsY = tabs.Bottom + 6;
             var btnReset = new Button
             {
                 Text = "Reset to Defaults",
-                Location = new Point(outerMargin, buttonsY),
+                Location = new Point(8, buttonsY),
                 Width = 120,
                 Height = 28,
                 FlatStyle = FlatStyle.Flat,
@@ -2813,13 +2981,18 @@ namespace PS2Disassembler
                 SelectComboItem(_cbConstantWriteRate,
                     AppSettings.DefaultConstantWriteRate.ToString(System.Globalization.CultureInfo.InvariantCulture),
                     AppSettings.DefaultConstantWriteRate.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                _chkShowMemoryView.Checked = AppSettings.DefaultShowMemoryView;
+                _tbDebugHost.Text = AppSettings.DefaultDebugHost;
+                _tbPinePort.Text = AppSettings.DefaultPinePort.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                _tbMcpPort.Text = AppSettings.DefaultMcpPort.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                tabs.SelectedIndex = 0;
             };
             Controls.Add(btnReset);
 
             var btnCancel = new Button
             {
                 Text = "Close",
-                Location = new Point(ClientSize.Width - 94, buttonsY),
+                Location = new Point(ClientSize.Width - 86, buttonsY),
                 Width = 78,
                 Height = 28,
                 FlatStyle = FlatStyle.Flat,
@@ -2830,7 +3003,7 @@ namespace PS2Disassembler
             var btnOk = new Button
             {
                 Text = "Apply",
-                Location = new Point(ClientSize.Width - 180, buttonsY),
+                Location = new Point(ClientSize.Width - 172, buttonsY),
                 Width = 78,
                 Height = 28,
                 FlatStyle = FlatStyle.Flat,
@@ -2839,9 +3012,17 @@ namespace PS2Disassembler
             Controls.Add(btnOk);
 
             CancelButton = btnCancel;
-            ClientSize = new Size(ClientSize.Width, btnOk.Bottom + 16);
-            Shown += (_, _) => ActiveControl = btnOk;
+            ClientSize = new Size(ClientSize.Width, btnOk.Bottom + 6);
+            Shown += (_, _) => ActiveControl = tabs;
             ResumeLayout(false);
+        }
+
+        private static int ParsePort(string? text, int fallback)
+        {
+            if (int.TryParse(text, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int value))
+                return AppSettings.NormalizePort(value, fallback);
+
+            return fallback;
         }
 
         private static void SelectComboItem(ComboBox comboBox, string? preferredText, string fallbackText)

@@ -91,7 +91,6 @@ namespace PS2Disassembler
         private DateTime _nextPineRetryUtc = DateTime.MinValue;
         private PineDebugWindow? _pineDebugWindow;
         private readonly Queue<string> _pineLogBacklog = new();
-        private const int PineLogBacklogMax = 512;
 
         // Optional PCSX2 debug server support (required for breakpoints/step/watchpoints).
         private readonly DebugServerClient _debugServer = new();
@@ -256,6 +255,7 @@ namespace PS2Disassembler
         private readonly VirtualDisasmList    _hexList;
         private readonly FlatTabHost          _mainTabs;   // Disassembler | Memory View | Code Manager
         private readonly FlatTabPage          _memoryViewPage;
+        private ToolStripMenuItem?            _miGoToMemoryView;
         private readonly StatusStrip          _statusStrip;
         private readonly ToolStripStatusLabel _sbInfo;
         private readonly ToolStripStatusLabel _sbAddr;
@@ -410,9 +410,20 @@ namespace PS2Disassembler
             // Set application icon
             try
             {
-                string iconPath = System.IO.Path.Combine(AppContext.BaseDirectory, "icon.ico");
-                if (System.IO.File.Exists(iconPath))
+                string[] iconCandidates =
+                {
+                    System.IO.Path.Combine(AppContext.BaseDirectory, "icon.ico"),
+                    System.IO.Path.Combine(AppContext.BaseDirectory, "assets", "icon.ico")
+                };
+
+                foreach (string iconPath in iconCandidates)
+                {
+                    if (!System.IO.File.Exists(iconPath))
+                        continue;
+
                     Icon = new Icon(iconPath);
+                    break;
+                }
             }
             catch { /* non-fatal */ }
 
@@ -425,8 +436,8 @@ namespace PS2Disassembler
             fileMenu.DropDownItems.Add(_miSave);
             fileMenu.DropDownItems.Add("Import Labels",       null, (_, _) => ImportLabelsFromElf());
             fileMenu.DropDownItems.Add(new ToolStripSeparator());
-            _miAttach = new ToolStripMenuItem("Attach to PCSX2",       null, (_, _) => AttachToPcsx2());
-            _miDetach = new ToolStripMenuItem("Detach from PCSX2",     null, (_, _) => DetachFromPcsx2()) { Enabled = false };
+            _miAttach = new ToolStripMenuItem("Connect to PCSX2",      null, (_, _) => AttachToPcsx2());
+            _miDetach = new ToolStripMenuItem("Disconnect from PCSX2",  null, (_, _) => DetachFromPcsx2()) { Enabled = false };
             fileMenu.DropDownItems.Add(_miAttach);
             fileMenu.DropDownItems.Add(_miDetach);
             fileMenu.DropDownItems.Add("Open PCSX2dis Project",          null, (_, _) => OpenPcsx2DisProject());
@@ -467,6 +478,8 @@ namespace PS2Disassembler
                 _miBreakpointsSidebar,
                 _miSetBreakpoint,
                 _miClearBreakpoints,
+                new ToolStripSeparator(),
+                new ToolStripMenuItem("Access Monitor", null, (_, _) => ShowAccessMonitorWindow()),
             });
 
             _menuStatusSpring = new ToolStripLabel
@@ -578,7 +591,8 @@ namespace PS2Disassembler
             var miCtxFreeze = new ToolStripMenuItem("Freeze", null, (_, _) => FreezeSelectedRowToCodes());
             ctx.Items.Add(miCtxFreeze);
             ctx.Items.Add("Copy Line", null, (_, _) => CopyLineForSelectedRow());
-            ctx.Items.Add("Go to in Memory View", null, (_, _) => GoToSelectedRowInMemoryView());
+            _miGoToMemoryView = new ToolStripMenuItem("Go to in Memory View", null, (_, _) => GoToSelectedRowInMemoryView());
+            ctx.Items.Add(_miGoToMemoryView);
             _miCtxEditSeparator = new ToolStripSeparator();
             ctx.Items.Add(_miCtxEditSeparator);
             _miCtxNopOpcode = new ToolStripMenuItem("NOP Op-Code", null, (_, _) => NopSelectedOpcode());
@@ -759,6 +773,8 @@ namespace PS2Disassembler
 
             // Load persisted settings before applying theme
             _appSettings = AppSettings.Load();
+            ApplyDebugConnectionSettings();
+            ApplyMemoryViewVisibilitySetting();
             ApplyFontFromSettings(_appSettings.FontFamily, _appSettings.FontSize);
             var startupTheme = _appSettings.Theme == "Light" ? AppTheme.Light : AppTheme.Dark;
             ApplyTheme(startupTheme);

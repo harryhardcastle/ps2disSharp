@@ -60,7 +60,7 @@ namespace PS2Disassembler
             readPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             readPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
             readPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            _chkReadBreakpoint = new CheckBox { Text = "OnRead:", AutoSize = true, Margin = new Padding(0, 4, 6, 0) };
+            _chkReadBreakpoint = new ThemedCheckBox { Text = "OnRead:", AutoSize = true, Margin = new Padding(0, 4, 6, 0) };
             _txtReadBreakpoint = new CenteredSingleLineTextBox { Dock = DockStyle.Fill, MaxLength = 8, CharacterCasing = CharacterCasing.Upper, Margin = new Padding(0) };
             _chkReadBreakpoint.CheckedChanged += (_, _) => ApplyMemoryBreakpointInput(isRead: true, showErrors: false);
             _txtReadBreakpoint.Leave += (_, _) => ApplyMemoryBreakpointInput(isRead: true, showErrors: false);
@@ -79,7 +79,7 @@ namespace PS2Disassembler
             writePanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             writePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
             writePanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            _chkWriteBreakpoint = new CheckBox { Text = "OnWrite:", AutoSize = true, Margin = new Padding(0, 4, 6, 0) };
+            _chkWriteBreakpoint = new ThemedCheckBox { Text = "OnWrite:", AutoSize = true, Margin = new Padding(0, 4, 6, 0) };
             _txtWriteBreakpoint = new CenteredSingleLineTextBox { Dock = DockStyle.Fill, MaxLength = 8, CharacterCasing = CharacterCasing.Upper, Margin = new Padding(0) };
             _chkWriteBreakpoint.CheckedChanged += (_, _) => ApplyMemoryBreakpointInput(isRead: false, showErrors: false);
             _txtWriteBreakpoint.Leave += (_, _) => ApplyMemoryBreakpointInput(isRead: false, showErrors: false);
@@ -642,12 +642,6 @@ namespace PS2Disassembler
                                                   (startAddress.Value >= mc.Start && startAddress.Value < mc.End));
         }
 
-        private bool IsTrackedWatchAddress(uint address)
-        {
-            return (_readMemcheckAddress.HasValue && _readMemcheckAddress.Value == address) ||
-                   (_writeMemcheckAddress.HasValue && _writeMemcheckAddress.Value == address);
-        }
-
         private static uint GetWatchpointEndAddress(uint address)
         {
             return address + WatchpointSizeBytes;
@@ -723,19 +717,6 @@ namespace PS2Disassembler
         {
             uint size = Math.Max(1u, _accessMonitorSizeBytes);
             return address + size;
-        }
-
-        private static bool MemcheckLooksTriggered(DebugMemcheckInfo info, uint? trackedAddress)
-        {
-            if (!trackedAddress.HasValue)
-                return false;
-
-            uint tracked = trackedAddress.Value;
-            bool exactLastAddressMatches = info.LastAddr == tracked;
-            bool lastAddressMatches = info.LastAddr != 0 && info.LastAddr >= info.Start && (info.End == 0 || info.LastAddr < info.End);
-            bool lastPcOnlyHit = info.LastAddr == 0 && info.LastPc != 0;
-
-            return exactLastAddressMatches || lastAddressMatches || lastPcOnlyHit;
         }
 
         private bool SuspendWatchpoints()
@@ -881,7 +862,7 @@ namespace PS2Disassembler
 
             if (!EnsureDebugServerConnected(forceRetry: true))
             {
-                MessageBox.Show("Breakpoint control requires a PCSX2 build exposing the optional debug server on port 21512. Plain PINE access is not enough for stepping or breakpoints.", "Breakpoints", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show($"Breakpoint control requires a PCSX2 build exposing the optional debug server on port {_debugServer.Port}. Plain PINE access is not enough for stepping or breakpoints.", "Breakpoints", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 ClearPausedBreakpointMenuStatus();
                 return;
             }
@@ -1470,7 +1451,7 @@ namespace PS2Disassembler
             {
                 txt.BackColor = _themeEditInvalidBack;
                 if (showErrors)
-                    MessageBox.Show("Watchpoints require a PCSX2 build exposing the optional debug server on port 21512.", isRead ? "OnRead" : "OnWrite", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    MessageBox.Show($"Watchpoints require a PCSX2 build exposing the optional debug server on port {_debugServer.Port}.", isRead ? "OnRead" : "OnWrite", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 chk.Checked = false;
                 return;
             }
@@ -1559,11 +1540,26 @@ namespace PS2Disassembler
             StartAccessMonitor(address);
         }
 
+        private void CenterOwnedWindowOnMainForm(Form child)
+        {
+            Rectangle ownerBounds = Bounds;
+            int x = ownerBounds.Left + Math.Max(0, (ownerBounds.Width - child.Width) / 2);
+            int y = ownerBounds.Top + Math.Max(0, (ownerBounds.Height - child.Height) / 2);
+            child.StartPosition = FormStartPosition.Manual;
+            child.Location = new Point(x, y);
+        }
+
+        private void ShowAccessMonitorWindow()
+        {
+            ShowAccessMonitorForm();
+            RefreshAccessMonitorList();
+        }
+
         private void StartAccessMonitor(uint address)
         {
             if (!EnsureDebugServerConnected(forceRetry: true))
             {
-                MessageBox.Show("Access monitor requires a PCSX2 build exposing the debug server on port 21512.",
+                MessageBox.Show($"Access monitor requires a PCSX2 build exposing the debug server on port {_debugServer.Port}.",
                     "Access Monitor", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
@@ -1621,7 +1617,7 @@ namespace PS2Disassembler
                     try { _debugServer.Resume(); } catch { }
 
                 _nextDebuggerPollUtc = DateTime.UtcNow.AddMilliseconds(20);
-                ShowAccessMonitorForm(address);
+                ShowAccessMonitorForm();
                 RefreshAccessMonitorList();
             }
             catch (Exception ex)
@@ -1661,7 +1657,7 @@ namespace PS2Disassembler
             RefreshAccessMonitorList();
         }
 
-        private void ShowAccessMonitorForm(uint address)
+        private void ShowAccessMonitorForm()
         {
             if (_accessMonitorForm != null && !_accessMonitorForm.IsDisposed)
             {
@@ -1669,6 +1665,11 @@ namespace PS2Disassembler
                 ApplyThemeToControlTree(_accessMonitorForm);
                 ResizeAccessMonitorColumns();
                 ApplyThemeToWindowChrome(_accessMonitorForm, forceFrameRefresh: true);
+                if (!_accessMonitorForm.Visible)
+                {
+                    CenterOwnedWindowOnMainForm(_accessMonitorForm);
+                    _accessMonitorForm.Show(this);
+                }
                 _accessMonitorForm.BringToFront();
                 return;
             }
@@ -1678,7 +1679,7 @@ namespace PS2Disassembler
                 Text = "Access Monitor",
                 Width = 550,
                 Height = 400,
-                StartPosition = FormStartPosition.CenterParent,
+                StartPosition = FormStartPosition.Manual,
                 FormBorderStyle = FormBorderStyle.Sizable,
                 ShowInTaskbar = false,
                 MaximizeBox = false,
@@ -1690,7 +1691,7 @@ namespace PS2Disassembler
 
             var statusLabel = new Label
             {
-                Text = $"Monitoring {address:X8}",
+                Text = _accessMonitorActive ? $"Monitoring {_accessMonitorAddress:X8}" : "Not monitoring.",
                 Dock = DockStyle.Fill,
                 AutoEllipsis = true,
                 TextAlign = ContentAlignment.MiddleLeft,
@@ -1776,9 +1777,16 @@ namespace PS2Disassembler
             frm.Controls.Add(bottomBar);
 
             frm.Shown += (_, _) => ApplyThemeToWindowChrome(frm, forceFrameRefresh: true);
-            frm.FormClosing += (_, _) =>
+            frm.FormClosing += (_, e) =>
             {
-                StopAccessMonitor(quiet: true);
+                if (e.CloseReason == CloseReason.UserClosing)
+                {
+                    StopAccessMonitor(quiet: true);
+                    e.Cancel = true;
+                    frm.Hide();
+                    return;
+                }
+
                 _accessMonitorForm = null;
                 _accessMonitorList = null;
                 _accessMonitorStatusLabel = null;
@@ -1786,6 +1794,7 @@ namespace PS2Disassembler
 
             _accessMonitorForm = frm;
             ApplyThemeToControlTree(frm);
+            CenterOwnedWindowOnMainForm(frm);
             frm.Show(this);
             ResizeAccessMonitorColumns();
             ApplyThemeToWindowChrome(frm, forceFrameRefresh: true);
@@ -2563,18 +2572,6 @@ namespace PS2Disassembler
                 score += 1;
 
             return score;
-        }
-
-        private bool TryReadEeUInt32(uint address, out uint value)
-        {
-            if (TryReadEeMemory(address, 4, out byte[] data) && data.Length >= 4)
-            {
-                value = BitConverter.ToUInt32(data, 0);
-                return true;
-            }
-
-            value = 0;
-            return false;
         }
 
         private bool TryReadEeMemory(uint address, int length, out byte[] data)
