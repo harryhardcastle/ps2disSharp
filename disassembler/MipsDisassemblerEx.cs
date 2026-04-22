@@ -344,7 +344,7 @@ namespace PS2Disassembler
                 case 0x16: return Row(pc,w,"dsrlv",  $"{R(rd)}, {R(rt)}, {R(rs)}",InstructionType.Alu);
                 case 0x17: return Row(pc,w,"dsrav",  $"{R(rd)}, {R(rt)}, {R(rs)}",InstructionType.Alu);
                 case 0x18: return Row(pc,w,"mult",   $"{R(rd)}, {R(rs)}, {R(rt)}",InstructionType.Alu);
-                case 0x19: return Row(pc,w,"multu",  $"{R(rd)}, {R(rs)}, {R(rt)}",InstructionType.Alu);
+                case 0x19: return Row(pc,w,"multu",  rd==0?$"{R(rs)}, {R(rt)}":$"{R(rd)}, {R(rs)}, {R(rt)}",InstructionType.Alu);
                 case 0x1A: return Row(pc,w,"div",    $"{R(rs)}, {R(rt)}",          InstructionType.Alu);
                 case 0x1B: return Row(pc,w,"divu",   $"{R(rs)}, {R(rt)}",          InstructionType.Alu);
                 case 0x20: return Row(pc,w,"add",    $"{R(rd)}, {R(rs)}, {R(rt)}",InstructionType.Alu);
@@ -523,6 +523,7 @@ namespace PS2Disassembler
                 {
                     string o = m == "plzcw" ? $"{R(rd)}" :
                                m is "mfhi1" or "mflo1" ? $"{R(rd != 0 ? rd : rt)}" :
+                               m == "multu1" ? (rd == 0 ? $"{R(rs)}, {R(rt)}" : $"{R(rd)}, {R(rs)}, {R(rt)}") :
                                m is "mthi1" or "mtlo1" or "div1" or "divu1" ? $"{R(rs)}, {R(rt)}" :
                                m is "pmfhl" ? $"{R(rd)}, {sa}" :
                                m is "pmthl" ? $"{R(rs)}, {sa}" :

@@ -255,6 +255,9 @@ namespace PS2Disassembler
         private readonly VirtualDisasmList    _hexList;
         private readonly FlatTabHost          _mainTabs;   // Disassembler | Memory View | Code Manager
         private readonly FlatTabPage          _memoryViewPage;
+        private ToolStripMenuItem?            _miDisassemblerMenu;
+        private ToolStripMenuItem?            _miMainMemoryViewMenu;
+        private ToolStripMenuItem?            _miCodeManagerMenu;
         private ToolStripMenuItem?            _miGoToMemoryView;
         private readonly StatusStrip          _statusStrip;
         private readonly ToolStripStatusLabel _sbInfo;
@@ -428,7 +431,12 @@ namespace PS2Disassembler
             catch { /* non-fatal */ }
 
             // ── Menu ──────────────────────────────────────────────────────
-            _menuBar = new ClickThroughMenuStrip();
+            _menuBar = new ClickThroughMenuStrip
+            {
+                Dock = DockStyle.Top,
+                Margin = Padding.Empty,
+                Padding = Padding.Empty,
+            };
 
             var fileMenu = new ToolStripMenuItem("File");
             fileMenu.DropDownItems.Add("Open Binary",             null, (_, _) => OpenBinary());
@@ -464,6 +472,13 @@ namespace PS2Disassembler
             var anaMenu = new ToolStripMenuItem("Analyzer");
             anaMenu.DropDownItems.Add("Invoke Analyzer", null, (_, _) => RunXrefAnalyzer());
             anaMenu.DropDownItems.Add("Debug Window", null, (_, _) => ShowPineDebugWindow());
+
+            _miDisassemblerMenu = new ToolStripMenuItem("Disassembler");
+            _miDisassemblerMenu.Click += (_, _) => ActivateMainViewTab(0);
+            _miMainMemoryViewMenu = new ToolStripMenuItem("Memory View");
+            _miMainMemoryViewMenu.Click += (_, _) => ActivateMainViewTab(1);
+            _miCodeManagerMenu = new ToolStripMenuItem("Code Manager") { Enabled = false, Visible = false };
+            _miCodeManagerMenu.Click += (_, _) => ActivateMainViewTab(2);
 
             var breakpointsMenu = new ToolStripMenuItem("Breakpoints");
             _miBreakpointsMenu = breakpointsMenu;
@@ -510,12 +525,18 @@ namespace PS2Disassembler
                     SetActivityStatus("Ready");
             };
 
+            foreach (ToolStripItem topLevelItem in new ToolStripItem[] { fileMenu, editMenu, viewMenu, anaMenu, _miDisassemblerMenu, _miMainMemoryViewMenu, _miCodeManagerMenu, breakpointsMenu })
+            {
+                topLevelItem.Margin = Padding.Empty;
+            }
+
             _menuBar.Items.AddRange(new ToolStripItem[]
-                { fileMenu, editMenu, viewMenu, anaMenu, breakpointsMenu, _menuStatusSpring, _menuStatusLabel });
+                { fileMenu, editMenu, viewMenu, anaMenu, _miDisassemblerMenu, _miMainMemoryViewMenu, _miCodeManagerMenu, breakpointsMenu, _menuStatusSpring, _menuStatusLabel });
             MainMenuStrip = _menuBar;
             _menuBar.MouseDown += OnMenuBarMouseDown;
             _menuBar.SizeChanged += (_, _) => UpdateMenuStatusLayout();
             UpdateMenuStatusLayout();
+            SyncMainViewMenuState();
 
 
             // ── Hex panel (fully virtual) ──────────────────────────────────
@@ -638,9 +659,11 @@ namespace PS2Disassembler
             _mainTabs = new FlatTabHost
             {
                 Dock = DockStyle.Fill,
+                ShowTabStrip = !AppSettings.DefaultShowTabsInTitleBar,
             };
             _mainTabs.SelectedIndexChanged += (_, _) =>
             {
+                SyncMainViewMenuState();
                 int idx = _mainTabs.SelectedIndex;
                 // Recalculate hex rows when switching to Memory View
                 if (idx == 1)
@@ -704,7 +727,7 @@ namespace PS2Disassembler
             _memoryViewPage.Controls.Add(_hexList);
 
             // Code Manager tab: panel that will host CodeToolsDialog's inner TabControl
-            var codeManagerPanel = new Panel { Dock = DockStyle.Fill, Tag = "CodeManagerPanel", Margin = new Padding(0), Padding = new Padding(1) };
+            var codeManagerPanel = new Panel { Dock = DockStyle.Fill, Tag = "CodeManagerPanel", Margin = new Padding(0), Padding = new Padding(0) };
             tpCodes.Controls.Add(codeManagerPanel);
 
             // ── Status bar ────────────────────────────────────────────────
@@ -774,10 +797,12 @@ namespace PS2Disassembler
             // Load persisted settings before applying theme
             _appSettings = AppSettings.Load();
             ApplyDebugConnectionSettings();
+            ApplyMainViewNavigationModeSetting();
             ApplyMemoryViewVisibilitySetting();
             ApplyFontFromSettings(_appSettings.FontFamily, _appSettings.FontSize);
             var startupTheme = _appSettings.Theme == "Light" ? AppTheme.Light : AppTheme.Dark;
             ApplyTheme(startupTheme);
+            UpdateDisassemblyChromeVisibility();
             ResumeLayout();
 
             // Apply theme again once handles exist so SetWindowTheme takes effect on all controls
@@ -787,6 +812,47 @@ namespace PS2Disassembler
                 Load += (_, _) => LoadFile(startFile, isRawDump: false);
         }
 
+        private void ActivateMainViewTab(int index)
+        {
+            if (_mainTabs.Pages.Count <= index || index < 0)
+                return;
+
+            if (index == 1 && !(_appSettings?.ShowMemoryView ?? AppSettings.DefaultShowMemoryView))
+                return;
+
+            if (index == 2 && !IsLiveAttached())
+                return;
+
+            _mainTabs.SelectedIndex = index;
+            SyncMainViewMenuState();
+        }
+
+        private void SyncMainViewMenuState()
+        {
+            int selectedIndex = _mainTabs?.SelectedIndex ?? -1;
+            bool showMemoryView = _appSettings?.ShowMemoryView ?? AppSettings.DefaultShowMemoryView;
+            bool showCodeManager = IsLiveAttached();
+            bool showTabsInTitleBar = _appSettings?.ShowTabsInTitleBar ?? AppSettings.DefaultShowTabsInTitleBar;
+
+            if (_miDisassemblerMenu != null)
+            {
+                _miDisassemblerMenu.Visible = showTabsInTitleBar;
+                _miDisassemblerMenu.Checked = showTabsInTitleBar && selectedIndex == 0;
+            }
+
+            if (_miMainMemoryViewMenu != null)
+            {
+                _miMainMemoryViewMenu.Visible = showTabsInTitleBar && showMemoryView;
+                _miMainMemoryViewMenu.Checked = showTabsInTitleBar && showMemoryView && selectedIndex == 1;
+            }
+
+            if (_miCodeManagerMenu != null)
+            {
+                _miCodeManagerMenu.Visible = showTabsInTitleBar && showCodeManager;
+                _miCodeManagerMenu.Enabled = showCodeManager;
+                _miCodeManagerMenu.Checked = showTabsInTitleBar && showCodeManager && selectedIndex == 2;
+            }
+        }
 
 
         // MainForm is intentionally split across partial files:

@@ -88,7 +88,7 @@ namespace PS2Disassembler
                             innerTabs.Dock = DockStyle.Fill;
                             innerTabs.Margin = new Padding(0);
                             innerTabs.BackColor = _themeCodeManagerBack;
-                            codePanel.Padding = new Padding(1);
+                            codePanel.Padding = new Padding(0);
                             codePanel.BackColor = _themeCodeManagerBack;
                             codePanel.Controls.Add(innerTabs);
                             ApplyThemeToControlTree(codePanel);
@@ -153,16 +153,155 @@ namespace PS2Disassembler
             if (patches == null || patches.Count == 0)
                 return null;
 
-            string? pineErr = TryWritePatchesViaPine(patches);
-            if (pineErr == null)
+            var normalized = NormalizePatches(patches);
+            if (normalized.Count == 0)
                 return null;
 
-            LogPine($"Falling back to process memory writes: {pineErr}");
+            const int PauseBatchThreshold = 64;
+            const int DirectFallbackThreshold = 256;
 
-            if (_liveProcId != 0 && _eeHostAddr != 0)
-                return WritePatchesToPcsx2(_liveProcId, _eeHostAddr, patches, repeatWrites);
+            bool resumeAfterPatch = false;
+            bool pausedForPatch = false;
+            string? pauseErr = null;
 
-            return WritePatchesToPcsx2(patches, repeatWrites);
+            try
+            {
+                if (normalized.Count >= PauseBatchThreshold)
+                {
+                    pausedForPatch = TryPauseVmForBulkPatch(out resumeAfterPatch, out pauseErr);
+                    if (!pausedForPatch && !string.IsNullOrWhiteSpace(pauseErr))
+                        LogPine($"Bulk patch pause skipped: {pauseErr}");
+                }
+
+                string? pineErr = TryWritePatchesViaPine(normalized);
+                if (pineErr == null)
+                    return null;
+
+                bool allowDirectFallback = normalized.Count < DirectFallbackThreshold;
+                if (!allowDirectFallback)
+                {
+                    LogPine($"PINE bulk write failed and direct fallback was skipped for safety ({normalized.Count} normalized patch(es)): {pineErr}");
+                    return pineErr;
+                }
+
+                LogPine($"Falling back to process memory writes: {pineErr}");
+
+                if (_liveProcId != 0 && _eeHostAddr != 0)
+                    return WritePatchesToPcsx2(_liveProcId, _eeHostAddr, normalized, repeatWrites);
+
+                return WritePatchesToPcsx2(normalized, repeatWrites);
+            }
+            finally
+            {
+                RestoreVmAfterBulkPatch(resumeAfterPatch);
+            }
+        }
+
+        private bool TryPauseVmForBulkPatch(out bool resumeAfter, out string? error)
+        {
+            resumeAfter = false;
+            error = null;
+
+            try
+            {
+                if (!EnsureDebugServerConnected(forceRetry: true))
+                {
+                    error = $"Debug server not available on port {_debugServer.Port}.";
+                    return false;
+                }
+
+                var status = _debugServer.GetStatus();
+                if (status.Paused)
+                    return true;
+
+                _debugServer.Pause();
+                for (int attempt = 0; attempt < 30; attempt++)
+                {
+                    Thread.Sleep(10);
+                    if (_debugServer.GetStatus().Paused)
+                    {
+                        resumeAfter = true;
+                        return true;
+                    }
+                }
+
+                error = "Timed out waiting for PCSX2 to pause before patching.";
+                return false;
+            }
+            catch (Exception ex)
+            {
+                try { _debugServer.Disconnect(); } catch { }
+                _debugServerAvailable = false;
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        private void RestoreVmAfterBulkPatch(bool resumeAfter)
+        {
+            if (!resumeAfter)
+                return;
+
+            try
+            {
+                _debugServer.Resume();
+            }
+            catch
+            {
+                try { _debugServer.Disconnect(); } catch { }
+                _debugServerAvailable = false;
+            }
+        }
+
+        private static List<(uint Addr, byte[] Bytes)> NormalizePatches(IReadOnlyList<(uint Addr, byte[] Bytes)> patches)
+        {
+            var result = new List<(uint Addr, byte[] Bytes)>();
+            if (patches == null || patches.Count == 0)
+                return result;
+
+            var sorted = patches
+                .Where(p => p.Bytes != null && p.Bytes.Length > 0)
+                .OrderBy(p => p.Addr)
+                .ToList();
+
+            if (sorted.Count == 0)
+                return result;
+
+            uint currentAddr = sorted[0].Addr;
+            var currentBytes = new List<byte>(sorted[0].Bytes);
+
+            for (int i = 1; i < sorted.Count; i++)
+            {
+                uint nextAddr = sorted[i].Addr;
+                byte[] nextBytes = sorted[i].Bytes;
+                long currentEndExclusive = (long)currentAddr + currentBytes.Count;
+
+                if (nextAddr <= currentEndExclusive)
+                {
+                    long overlap = currentEndExclusive - nextAddr;
+                    int appendStart = 0;
+                    if (overlap > 0)
+                    {
+                        int overwriteCount = Math.Min((int)overlap, nextBytes.Length);
+                        int dstIndex = currentBytes.Count - (int)overlap;
+                        for (int j = 0; j < overwriteCount; j++)
+                            currentBytes[dstIndex + j] = nextBytes[j];
+                        appendStart = overwriteCount;
+                    }
+
+                    for (int j = appendStart; j < nextBytes.Length; j++)
+                        currentBytes.Add(nextBytes[j]);
+                }
+                else
+                {
+                    result.Add((currentAddr, currentBytes.ToArray()));
+                    currentAddr = nextAddr;
+                    currentBytes = new List<byte>(nextBytes);
+                }
+            }
+
+            result.Add((currentAddr, currentBytes.ToArray()));
+            return result;
         }
 
         private static bool TryWriteRemoteBytesSplit(IntPtr hProc, long destAddress, byte[] bytes, int offset, int length, int repeatWrites, out string? error)
@@ -374,28 +513,86 @@ namespace PS2Disassembler
         private void SaveDisasm()
         {
             if (_rows.Count == 0) return;
+
+            string baseName = Path.GetFileNameWithoutExtension(string.IsNullOrWhiteSpace(_currentProjectPath) ? _fileName : _currentProjectPath);
+            if (string.IsNullOrWhiteSpace(baseName))
+                baseName = "project";
+
             using var dlg = new SaveFileDialog
             {
-                Title    = "Save Disassembly",
-                Filter   = "Assembly (*.asm)|*.asm|Text (*.txt)|*.txt|All files|*.*",
-                FileName = Path.GetFileNameWithoutExtension(_fileName) + ".asm",
+                Title = "Save Disassembly",
+                Filter = "PCSX2Dis Project (*.ide)|*.ide|PS2dis Project (*.pis)|*.pis|Binary (*.bin)|*.bin|Assembly (*.asm)|*.asm|Text (*.txt)|*.txt|All files (*.*)|*.*",
+                FilterIndex = 1,
+                DefaultExt = "ide",
+                AddExtension = true,
+                FileName = baseName,
             };
+
+            if (!string.IsNullOrWhiteSpace(_currentProjectPath))
+                dlg.InitialDirectory = Path.GetDirectoryName(_currentProjectPath);
+
             if (dlg.ShowDialog(this) != DialogResult.OK) return;
-            var sb = new StringBuilder();
-            sb.AppendLine($"; ps2dis output \u2014 {_fileName}");
-            sb.AppendLine($"; Base: 0x{_baseAddr:X8}   Region: 0x{_disasmBase:X8} + 0x{_disasmLen:X}");
-            sb.AppendLine();
-            foreach (var raw in _rows)
+
+            string fileName = dlg.FileName;
+            string ext = Path.GetExtension(fileName).ToLowerInvariant();
+            if (string.IsNullOrWhiteSpace(ext))
             {
-                var r = ResolveRowForDisplay(raw);
-                string? lbl = GetLabelAt(r.Address);
-                if (lbl != null) sb.AppendLine($"\n{lbl}:");
-                string cmt = _userComments.TryGetValue(r.Address, out var c) ? $"  ; {c}" : "";
-                sb.AppendLine($"  {r.Address:X8}  {r.HexWord}  {r.Mnemonic,-10} {r.Operands}{cmt}");
+                ext = dlg.FilterIndex switch
+                {
+                    1 => ".ide",
+                    2 => ".pis",
+                    3 => ".bin",
+                    4 => ".asm",
+                    5 => ".txt",
+                    _ => string.Empty,
+                };
+                if (!string.IsNullOrEmpty(ext))
+                    fileName += ext;
             }
-            File.WriteAllText(dlg.FileName, sb.ToString());
-            MessageBox.Show($"Saved to:\n{dlg.FileName}", "ps2dis",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
+
+            try
+            {
+                switch (ext)
+                {
+                    case ".ide":
+                        WritePcsx2DisProject(fileName);
+                        _currentProjectPath = fileName;
+                        break;
+
+                    case ".pis":
+                        WritePisProject(fileName);
+                        break;
+
+                    case ".bin":
+                        WriteRawBinaryFile(fileName, _fileData);
+                        break;
+
+                    case ".asm":
+                    case ".txt":
+                    default:
+                        var sb = new StringBuilder();
+                        sb.AppendLine($"; ps2dis output — {_fileName}");
+                        sb.AppendLine($"; Base: 0x{_baseAddr:X8}   Region: 0x{_disasmBase:X8} + 0x{_disasmLen:X}");
+                        sb.AppendLine();
+                        foreach (var raw in _rows)
+                        {
+                            var r = ResolveRowForDisplay(raw);
+                            string? lbl = GetLabelAt(r.Address);
+                            if (lbl != null) sb.AppendLine($"\n{lbl}:");
+                            string cmt = _userComments.TryGetValue(r.Address, out var c) ? $"  ; {c}" : "";
+                            sb.AppendLine($"  {r.Address:X8}  {r.HexWord}  {r.Mnemonic,-10} {r.Operands}{cmt}");
+                        }
+                        File.WriteAllText(fileName, sb.ToString());
+                        break;
+                }
+
+                MessageBox.Show($"Saved to:\n{fileName}", "ps2dis",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "Save Disassembly", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
         // ── User labels ───────────────────────────────────────────────────
@@ -1238,7 +1435,7 @@ namespace PS2Disassembler
             Text            = "Labels";
             Size            = new Size(520, 560);
             MinimumSize     = new Size(360, 300);
-            FormBorderStyle = FormBorderStyle.Sizable;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition   = FormStartPosition.CenterParent;
             Font            = new Font("Tahoma", 8.25f);
 
@@ -1759,7 +1956,7 @@ namespace PS2Disassembler
                 ForeColor = Color.FromArgb(232, 232, 232),
                 TabStripHeight = 24,
                 TabButtonHeight = 24,
-                TabStripTopPadding = 2,
+                TabStripTopPadding = 0,
                 TabButtonWidth = 120,
                 Tag = "CodeManagerTabHost"
             };
@@ -1844,7 +2041,7 @@ namespace PS2Disassembler
                 Location = new Point(pad, tpInject.ClientSize.Height - btnH - pad),
                 Anchor = AnchorStyles.Left | AnchorStyles.Bottom
             };
-            btnUpdateInject.Click += (_, _) => ApplyCodes(_tbInject, clearAfterApply: true);
+            btnUpdateInject.Click += (_, _) => ApplyCodes(_tbInject, clearAfterApply: true, probeReadable: false);
             injectSurface.Controls.Add(btnUpdateInject);
             var lblInjectSupport = new Label
             {
@@ -2047,22 +2244,22 @@ namespace PS2Disassembler
 
         private void ApplyActiveCodes(bool showMessage)
         {
-            var patches = ParseCodesText(_activeCodesText, out int applied, out int skipped);
+            var patches = ParseCodesText(_activeCodesText, out int applied, out int skipped, probeReadable: true);
             ApplyParsedPatches(patches, clearEditorAfterApply: false, editorToClear: null, showMessage: showMessage, applied: applied, skipped: skipped);
         }
 
-        private void ApplyCodes(TextBoxBase source, bool clearAfterApply, bool showMessage = true)
+        private void ApplyCodes(TextBoxBase source, bool clearAfterApply, bool showMessage = true, bool probeReadable = true)
         {
-            ApplyCodesText(source.Text, clearAfterApply, source, showMessage);
+            ApplyCodesText(source.Text, clearAfterApply, source, showMessage, probeReadable);
         }
 
-        private void ApplyCodesText(string sourceText, bool clearEditorAfterApply, TextBoxBase? editorToClear, bool showMessage = true)
+        private void ApplyCodesText(string sourceText, bool clearEditorAfterApply, TextBoxBase? editorToClear, bool showMessage = true, bool probeReadable = true)
         {
-            var patches = ParseCodesText(sourceText, out int applied, out int skipped);
+            var patches = ParseCodesText(sourceText, out int applied, out int skipped, probeReadable);
             ApplyParsedPatches(patches, clearEditorAfterApply, editorToClear, showMessage, applied, skipped);
         }
 
-        private List<(uint Addr, byte[] Bytes)> ParseCodesText(string sourceText, out int applied, out int skipped)
+        private List<(uint Addr, byte[] Bytes)> ParseCodesText(string sourceText, out int applied, out int skipped, bool probeReadable = true)
         {
             var patches = new List<(uint Addr, byte[] Bytes)>();
             applied = 0;
@@ -2127,7 +2324,7 @@ namespace PS2Disassembler
                     newBytes = new[] { (byte)(value & 0xFF), (byte)(value >> 8), (byte)(value >> 16), (byte)(value >> 24) };
                 }
 
-                if (_read(ps2Addr, newBytes.Length) == null)
+                if (probeReadable && _read(ps2Addr, newBytes.Length) == null)
                 {
                     skipped++;
                     continue;
@@ -2749,6 +2946,7 @@ namespace PS2Disassembler
         private readonly MainForm.FlatComboBox _cbRefreshRate;
         private readonly MainForm.FlatComboBox _cbConstantWriteRate;
         private readonly CheckBox _chkShowMemoryView;
+        private readonly CheckBox _chkShowTabsInTitleBar;
         private readonly TextBox _tbDebugHost;
         private readonly TextBox _tbPinePort;
         private readonly TextBox _tbMcpPort;
@@ -2768,16 +2966,26 @@ namespace PS2Disassembler
             ? v
             : AppSettings.DefaultConstantWriteRate;
         public bool SelectedShowMemoryView => _chkShowMemoryView.Checked;
+        public bool SelectedShowTabsInTitleBar => _chkShowTabsInTitleBar.Checked;
         public string SelectedDebugHost => AppSettings.NormalizeDebugHost(_tbDebugHost.Text);
         public int SelectedPinePort => ParsePort(_tbPinePort.Text, AppSettings.DefaultPinePort);
         public int SelectedMcpPort => ParsePort(_tbMcpPort.Text, AppSettings.DefaultMcpPort);
 
         public OptionsDialog(AppSettings settings, bool dark)
         {
+            const int optionsTabCount = 3;
+            const int optionsTabButtonWidth = 118;
+            const int optionsButtonStripHeight = 42;
+            const int optionsTabStripHeight = 24;
+            const int optionsContentBottomPadding = 12;
+            const int optionsContentHeight = 156 + 2 + 20 + optionsContentBottomPadding;
+            Size optionsClientSize = new Size(optionsTabCount * optionsTabButtonWidth, optionsTabStripHeight + optionsContentHeight + optionsButtonStripHeight);
+
             Text = $"Options - Version {AppSettings.AppVersion}";
-            ClientSize = new Size(354, 248);
+            ClientSize = optionsClientSize;
             Tag = "OptionsDialog";
-            FormBorderStyle = FormBorderStyle.FixedSingle;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MinimumSize = SizeFromClientSize(optionsClientSize);
             MaximizeBox = false;
             MinimizeBox = false;
             ShowInTaskbar = false;
@@ -2793,13 +3001,18 @@ namespace PS2Disassembler
             const int rowH = 34;
             const int topRowY = 20;
 
+            const int buttonStripHeight = 42;
+            const int buttonBottomMargin = 8;
+            const int buttonGap = 8;
+
             var tabs = new MainForm.FlatTabHost
             {
                 Location = new Point(0, 0),
-                Size = new Size(ClientSize.Width, 186),
+                Size = new Size(ClientSize.Width, ClientSize.Height - buttonStripHeight),
+                Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
                 TabStop = true,
                 TabStripTopPadding = 0,
-                TabButtonWidth = 118,
+                TabButtonWidth = optionsTabButtonWidth,
                 Margin = new Padding(0),
                 Tag = "OptionsTabHost",
             };
@@ -2808,7 +3021,7 @@ namespace PS2Disassembler
             var tabPcsx2 = new MainForm.FlatTabPage("PCSX2") { Tag = "OptionsTabPage" };
             var tabDebug = new MainForm.FlatTabPage("DEBUG") { Tag = "OptionsTabPage" };
 
-            var pnlUi = new Panel { Dock = DockStyle.Fill, Padding = new Padding(12), Margin = new Padding(0), Tag = "OptionsSurface" };
+            var pnlUi = new Panel { Dock = DockStyle.Fill, Padding = new Padding(12), Margin = new Padding(0), AutoScroll = true, Tag = "OptionsSurface" };
             pnlUi.Controls.Add(new Label { Text = "Font:", Location = new Point(innerLabelX, topRowY + 3), AutoSize = true });
             _cbFont = new MainForm.FlatComboBox
             {
@@ -2885,9 +3098,20 @@ namespace PS2Disassembler
                 TabStop = true,
             };
             pnlUi.Controls.Add(_chkShowMemoryView);
+
+            int showTabsInTitleBarRowY = showMemoryRowY + rowH;
+            _chkShowTabsInTitleBar = new MainForm.ThemedCheckBox
+            {
+                Text = "Show Tabs in Title Bar",
+                Location = new Point(innerLabelX, showTabsInTitleBarRowY + 2),
+                AutoSize = true,
+                Checked = settings.ShowTabsInTitleBar,
+                TabStop = true,
+            };
+            pnlUi.Controls.Add(_chkShowTabsInTitleBar);
             tabUi.Controls.Add(pnlUi);
 
-            var pnlPcsx2 = new Panel { Dock = DockStyle.Fill, Padding = new Padding(12), Margin = new Padding(0), Tag = "OptionsSurface" };
+            var pnlPcsx2 = new Panel { Dock = DockStyle.Fill, Padding = new Padding(12), Margin = new Padding(0), AutoScroll = true, Tag = "OptionsSurface" };
             pnlPcsx2.Controls.Add(new Label { Text = "Refresh Rate:", Location = new Point(innerLabelX, topRowY + 3), AutoSize = true });
             _cbRefreshRate = new MainForm.FlatComboBox
             {
@@ -2920,7 +3144,7 @@ namespace PS2Disassembler
             pnlPcsx2.Controls.Add(_cbConstantWriteRate);
             tabPcsx2.Controls.Add(pnlPcsx2);
 
-            var pnlDebug = new Panel { Dock = DockStyle.Fill, Padding = new Padding(12), Margin = new Padding(0), Tag = "OptionsSurface" };
+            var pnlDebug = new Panel { Dock = DockStyle.Fill, Padding = new Padding(12), Margin = new Padding(0), AutoScroll = true, Tag = "OptionsSurface" };
             pnlDebug.Controls.Add(new Label { Text = "Host:", Location = new Point(innerLabelX, topRowY + 3), AutoSize = true });
             _tbDebugHost = new TextBox
             {
@@ -2959,7 +3183,7 @@ namespace PS2Disassembler
             tabs.AddPage(tabDebug);
             Controls.Add(tabs);
 
-            int buttonsY = tabs.Bottom + 6;
+            int buttonsY = ClientSize.Height - buttonBottomMargin - 28;
             var btnReset = new Button
             {
                 Text = "Reset to Defaults",
@@ -2967,6 +3191,7 @@ namespace PS2Disassembler
                 Width = 120,
                 Height = 28,
                 FlatStyle = FlatStyle.Flat,
+                Anchor = AnchorStyles.Left | AnchorStyles.Bottom,
             };
             btnReset.Click += (_, _) =>
             {
@@ -2982,6 +3207,7 @@ namespace PS2Disassembler
                     AppSettings.DefaultConstantWriteRate.ToString(System.Globalization.CultureInfo.InvariantCulture),
                     AppSettings.DefaultConstantWriteRate.ToString(System.Globalization.CultureInfo.InvariantCulture));
                 _chkShowMemoryView.Checked = AppSettings.DefaultShowMemoryView;
+                _chkShowTabsInTitleBar.Checked = AppSettings.DefaultShowTabsInTitleBar;
                 _tbDebugHost.Text = AppSettings.DefaultDebugHost;
                 _tbPinePort.Text = AppSettings.DefaultPinePort.ToString(System.Globalization.CultureInfo.InvariantCulture);
                 _tbMcpPort.Text = AppSettings.DefaultMcpPort.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -2992,27 +3218,28 @@ namespace PS2Disassembler
             var btnCancel = new Button
             {
                 Text = "Close",
-                Location = new Point(ClientSize.Width - 86, buttonsY),
+                Location = new Point(ClientSize.Width - 8 - 78, buttonsY),
                 Width = 78,
                 Height = 28,
                 FlatStyle = FlatStyle.Flat,
                 DialogResult = DialogResult.Cancel,
+                Anchor = AnchorStyles.Right | AnchorStyles.Bottom,
             };
             Controls.Add(btnCancel);
 
             var btnOk = new Button
             {
                 Text = "Apply",
-                Location = new Point(ClientSize.Width - 172, buttonsY),
+                Location = new Point(ClientSize.Width - 8 - 78 - buttonGap - 78, buttonsY),
                 Width = 78,
                 Height = 28,
                 FlatStyle = FlatStyle.Flat,
+                Anchor = AnchorStyles.Right | AnchorStyles.Bottom,
             };
             btnOk.Click += (_, _) => ApplyRequested?.Invoke(this, EventArgs.Empty);
             Controls.Add(btnOk);
 
             CancelButton = btnCancel;
-            ClientSize = new Size(ClientSize.Width, btnOk.Bottom + 6);
             Shown += (_, _) => ActiveControl = tabs;
             ResumeLayout(false);
         }

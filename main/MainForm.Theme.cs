@@ -555,7 +555,7 @@ namespace PS2Disassembler
                     {
                         pnl.BackColor = _themeCodeManagerBack;
                         if (Equals(pnl.Tag, "CodeManagerPanel"))
-                            pnl.Padding = new Padding(1);
+                            pnl.Padding = new Padding(0);
                     }
                     else if (Equals(pnl.Tag, "OptionsSurface"))
                     {
@@ -1068,6 +1068,7 @@ namespace PS2Disassembler
             private int _tabButtonWidth = 118;
             private bool _paletteInitialized;
             private bool _dimTabs; // when true, tab buttons are rendered dimmer (for sub-tabs)
+            private bool _showTabStrip = true;
 
             public event EventHandler? SelectedIndexChanged;
             public IReadOnlyList<FlatTabPage> Pages => _pages;
@@ -1117,6 +1118,21 @@ namespace PS2Disassembler
             {
                 get => _dimTabs;
                 set { _dimTabs = value; UpdateSelection(); }
+            }
+
+            public bool ShowTabStrip
+            {
+                get => _showTabStrip;
+                set
+                {
+                    if (_showTabStrip == value)
+                        return;
+
+                    _showTabStrip = value;
+                    _tabStrip.Visible = value;
+                    UpdateLayoutMetrics();
+                    PerformLayout();
+                }
             }
 
             public Color? TabStripBackColorOverride
@@ -1263,8 +1279,9 @@ namespace PS2Disassembler
 
             private void UpdateLayoutMetrics()
             {
-                _tabStrip.Height = _tabStripHeight + _tabStripTopPadding;
-                _tabStrip.Padding = new Padding(0, _tabStripTopPadding, 0, 0);
+                _tabStrip.Visible = _showTabStrip;
+                _tabStrip.Height = _showTabStrip ? _tabStripHeight + _tabStripTopPadding : 0;
+                _tabStrip.Padding = _showTabStrip ? new Padding(0, _tabStripTopPadding, 0, 0) : new Padding(0);
                 foreach (var button in _buttons)
                 {
                     button.Width = _tabButtonWidth;
@@ -1638,6 +1655,7 @@ namespace PS2Disassembler
                 bool refreshRateChanged = _appSettings.RefreshRate != dlg.SelectedRefreshRate;
                 bool constantWriteRateChanged = _appSettings.ConstantWriteRate != dlg.SelectedConstantWriteRate;
                 bool memoryViewVisibilityChanged = _appSettings.ShowMemoryView != dlg.SelectedShowMemoryView;
+                bool mainViewNavigationModeChanged = _appSettings.ShowTabsInTitleBar != dlg.SelectedShowTabsInTitleBar;
                 bool debugEndpointChanged = !string.Equals(_appSettings.DebugHost, dlg.SelectedDebugHost, StringComparison.OrdinalIgnoreCase)
                                          || _appSettings.PinePort != dlg.SelectedPinePort
                                          || _appSettings.McpPort != dlg.SelectedMcpPort;
@@ -1648,6 +1666,7 @@ namespace PS2Disassembler
                 _appSettings.RefreshRate = dlg.SelectedRefreshRate;
                 _appSettings.ConstantWriteRate = dlg.SelectedConstantWriteRate;
                 _appSettings.ShowMemoryView = dlg.SelectedShowMemoryView;
+                _appSettings.ShowTabsInTitleBar = dlg.SelectedShowTabsInTitleBar;
                 _appSettings.DebugHost = dlg.SelectedDebugHost;
                 _appSettings.PinePort = dlg.SelectedPinePort;
                 _appSettings.McpPort = dlg.SelectedMcpPort;
@@ -1667,6 +1686,9 @@ namespace PS2Disassembler
 
                 if (constantWriteRateChanged)
                     UpdateConstantWriteTimerInterval();
+
+                if (mainViewNavigationModeChanged)
+                    ApplyMainViewNavigationModeSetting();
 
                 if (memoryViewVisibilityChanged)
                     ApplyMemoryViewVisibilitySetting();
@@ -1688,6 +1710,16 @@ namespace PS2Disassembler
             dlg.ShowDialog(this);
         }
 
+        private void ApplyMainViewNavigationModeSetting()
+        {
+            bool showTabsInTitleBar = _appSettings?.ShowTabsInTitleBar ?? AppSettings.DefaultShowTabsInTitleBar;
+
+            if (_mainTabs != null)
+                _mainTabs.ShowTabStrip = !showTabsInTitleBar;
+
+            SyncMainViewMenuState();
+        }
+
         private void ApplyMemoryViewVisibilitySetting()
         {
             bool showMemoryView = _appSettings?.ShowMemoryView ?? AppSettings.DefaultShowMemoryView;
@@ -1698,6 +1730,8 @@ namespace PS2Disassembler
 
             if (!showMemoryView && _mainTabs != null && _mainTabs.SelectedIndex == 1)
                 _mainTabs.SelectedIndex = 0;
+
+            SyncMainViewMenuState();
         }
 
         protected override void Dispose(bool disposing)

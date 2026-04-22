@@ -17,6 +17,28 @@ namespace PS2Disassembler
     {
         // ── Column management ─────────────────────────────────────────────
 
+        private bool ShouldShowDisassemblyChrome()
+            => _fileData != null;
+
+        private void UpdateDisassemblyChromeVisibility()
+        {
+            bool showChrome = ShouldShowDisassemblyChrome();
+
+            if (_asciiBytesBar != null)
+            {
+                _asciiBytesBar.Visible = showChrome;
+                _asciiBytesBar.Height = showChrome ? CurrentDisasmRowHeight : 0;
+            }
+
+            if (_disasmList == null || _disasmList.IsDisposed)
+                return;
+
+            _disasmList.HeaderStyle = showChrome ? ColumnHeaderStyle.Nonclickable : ColumnHeaderStyle.None;
+            _disasmList.AllowColumnResize = showChrome;
+            _disasmList.HeaderHeight = showChrome ? Math.Max(1, _mono.Height + 8) : 0;
+            _disasmList.Invalidate();
+        }
+
         private void RebuildColumns()
         {
             CancelInlineEdit();
@@ -128,8 +150,7 @@ namespace PS2Disassembler
             if (_disasmList == null || _disasmList.IsDisposed) return;
             _disasmList.Font = _mono;
             _disasmList.RowHeight = Math.Max(1, _disasmRowHeight);
-            _disasmList.HeaderHeight = Math.Max(1, _mono.Height + 8);
-            _disasmList.Invalidate();
+            UpdateDisassemblyChromeVisibility();
         }
 
         private void ApplyHexViewMetrics()
@@ -358,6 +379,9 @@ namespace PS2Disassembler
         private const uint PisMemoryChunkMagic = 0x00010004u;
         private const uint PisMemoryChunkTypeEeRam = 0x00000001u;
         private const int PisTailMinimumRunLength = 4;
+        private const ushort PisLabelSectionType1 = 0xDB02;
+        private const ushort PisLabelSectionType2 = 0xD802;
+        private const int PisLabelSectionHeaderSize = 0x0C;
 
         private static bool IsPisFile(byte[] data)
             => data.Length >= PisHeaderSize
@@ -493,11 +517,105 @@ namespace PS2Disassembler
             return PisHeaderSize;
         }
 
+        private static bool TryReadStructuredPisLabelSection(byte[] data, int headerOffset, out List<(uint Address, string Label)> labels, out int endOffset)
+        {
+            labels = new List<(uint Address, string Label)>();
+            endOffset = -1;
+
+            if (headerOffset < 0 || headerOffset + PisLabelSectionHeaderSize > data.Length)
+                return false;
+
+            uint labelBytes = BitConverter.ToUInt32(data, headerOffset);
+            ushort sectionType = BitConverter.ToUInt16(data, headerOffset + 4);
+            if (sectionType != PisLabelSectionType1 && sectionType != PisLabelSectionType2)
+                return false;
+
+            uint labelCount = BitConverter.ToUInt32(data, headerOffset + 8);
+            if (labelCount > 0x0010_0000u)
+                return false;
+
+            long declaredEnd = headerOffset + PisLabelSectionHeaderSize + labelBytes;
+            if (declaredEnd > data.Length)
+                return false;
+
+            int pos = headerOffset + PisLabelSectionHeaderSize;
+            for (uint i = 0; i < labelCount; i++)
+            {
+                if (pos + 5 > data.Length)
+                    return false;
+
+                uint rawAddress = BitConverter.ToUInt32(data, pos);
+                int nameLength = data[pos + 4];
+                if (nameLength <= 0 || nameLength > 255 || pos + 5 + nameLength > data.Length)
+                    return false;
+                if (rawAddress >= PisEeRamSize)
+                    return false;
+
+                for (int c = 0; c < nameLength; c++)
+                {
+                    byte b = data[pos + 5 + c];
+                    if (b < 0x20 || b > 0x7E)
+                        return false;
+                }
+
+                string label = CleanupPisImportedLabel(Encoding.ASCII.GetString(data, pos + 5, nameLength));
+                if (string.IsNullOrWhiteSpace(label))
+                    return false;
+
+                labels.Add((NormalizeImportedLabelAddress(rawAddress), label));
+                pos += 5 + nameLength;
+            }
+
+            if (pos > declaredEnd)
+                return false;
+
+            endOffset = pos;
+            return true;
+        }
+
+        private static int FindStructuredPisLabelSectionOffset(byte[] data, int payloadOffset, int tailStartOffset, out List<(uint Address, string Label)> labels)
+        {
+            labels = new List<(uint Address, string Label)>();
+            if (!IsPisFile(data) || tailStartOffset < payloadOffset || tailStartOffset >= data.Length)
+                return -1;
+
+            int markerStart = Math.Max(tailStartOffset + 4, 4);
+            for (int markerOffset = data.Length - 2; markerOffset >= markerStart; markerOffset--)
+            {
+                if (data[markerOffset] != 0x02)
+                    continue;
+                if (data[markerOffset + 1] != 0xDB && data[markerOffset + 1] != 0xD8)
+                    continue;
+
+                int headerOffset = markerOffset - 4;
+                if (headerOffset < tailStartOffset)
+                    continue;
+                if (!TryReadStructuredPisLabelSection(data, headerOffset, out var parsedLabels, out _))
+                    continue;
+
+                labels = parsedLabels
+                    .GroupBy(x => x.Address)
+                    .Select(g => g.OrderByDescending(x => x.Label.Length).First())
+                    .OrderBy(x => x.Address)
+                    .ToList();
+                return headerOffset;
+            }
+
+            return -1;
+        }
+
         private static int FindPisLabelSectionOffset(byte[] data, int payloadOffset, int tailStartOffset, out List<(uint Address, string Label)> labels)
         {
             labels = new List<(uint Address, string Label)>();
             if (!IsPisFile(data) || tailStartOffset < payloadOffset || tailStartOffset >= data.Length)
                 return -1;
+
+            int structuredOffset = FindStructuredPisLabelSectionOffset(data, payloadOffset, tailStartOffset, out var structuredLabels);
+            if (structuredOffset >= 0)
+            {
+                labels = structuredLabels;
+                return structuredOffset;
+            }
 
             int stringFirstOffset = FindPisLabelSectionOffsetCore(data, tailStartOffset, stringFirstLayout: true, out var stringFirstLabels, out int stringFirstEntryCount);
             int addressFirstOffset = FindPisLabelSectionOffsetCore(data, tailStartOffset, stringFirstLayout: false, out var addressFirstLabels, out int addressFirstEntryCount);
@@ -1077,6 +1195,100 @@ namespace PS2Disassembler
             bw.Write(_selRow >= 0 && _selRow < _rows.Count ? _rows[_selRow].Address : _baseAddr);
         }
 
+        private List<(uint Address, string Label)> CollectPisLabelsToSave()
+        {
+            var labelsToSave = new Dictionary<uint, string>();
+
+            foreach (var kv in _stringLabels)
+            {
+                string cleaned = CleanupImportedLabel(kv.Value ?? string.Empty);
+                if (string.IsNullOrWhiteSpace(cleaned))
+                    continue;
+                labelsToSave[NormalizeImportedLabelAddress(kv.Key)] = cleaned;
+            }
+
+            foreach (var kv in _userLabels)
+            {
+                string cleaned = CleanupImportedLabel(kv.Value ?? string.Empty);
+                if (string.IsNullOrWhiteSpace(cleaned))
+                    continue;
+                labelsToSave[NormalizeImportedLabelAddress(kv.Key)] = cleaned;
+            }
+
+            return labelsToSave
+                .OrderBy(kv => kv.Key)
+                .Select(kv => (kv.Key, kv.Value))
+                .ToList();
+        }
+
+        private byte[] BuildPisEeRamImage()
+        {
+            byte[] data = _fileData ?? Array.Empty<byte>();
+            if (data.Length == 0)
+                return Array.Empty<byte>();
+
+            uint normalizedBase = NormalizeImportedLabelAddress(_baseAddr);
+            if ((ulong)normalizedBase + (ulong)data.Length <= PisEeRamSize)
+            {
+                var eeRam = new byte[PisEeRamSize];
+                Buffer.BlockCopy(data, 0, eeRam, (int)normalizedBase, data.Length);
+                return eeRam;
+            }
+
+            return data.ToArray();
+        }
+
+        private void WritePisProject(string fileName)
+        {
+            byte[] eeRam = BuildPisEeRamImage();
+            var labelsToSave = CollectPisLabelsToSave();
+
+            using var fs = File.Create(fileName);
+            using var bw = new BinaryWriter(fs, Encoding.ASCII, leaveOpen: false);
+
+            bw.Write((byte)'P');
+            bw.Write((byte)'I');
+            bw.Write((byte)'S');
+            bw.Write((byte)0x1F);
+            if (PisHeaderSize > 4)
+                bw.Write(new byte[PisHeaderSize - 4]);
+
+            if (eeRam.Length > 0)
+                bw.Write(eeRam);
+
+            int labelBytesLength = 0;
+            var encodedLabels = new List<(uint Address, byte[] Bytes)>();
+            foreach (var (address, label) in labelsToSave)
+            {
+                string asciiLabel = CleanupPisImportedLabel(label);
+                if (string.IsNullOrWhiteSpace(asciiLabel))
+                    continue;
+
+                byte[] labelBytes = Encoding.ASCII.GetBytes(asciiLabel);
+                if (labelBytes.Length == 0)
+                    continue;
+                if (labelBytes.Length > byte.MaxValue)
+                    labelBytes = labelBytes.Take(byte.MaxValue).ToArray();
+
+                encodedLabels.Add((address, labelBytes));
+                labelBytesLength += 5 + labelBytes.Length;
+            }
+
+            bw.Write((uint)labelBytesLength);
+            bw.Write(PisLabelSectionType1);
+            bw.Write((ushort)0);
+            bw.Write((uint)encodedLabels.Count);
+            foreach (var (address, labelBytes) in encodedLabels)
+            {
+                bw.Write(address);
+                bw.Write((byte)labelBytes.Length);
+                bw.Write(labelBytes);
+            }
+        }
+
+        private static void WriteRawBinaryFile(string fileName, byte[]? data)
+            => File.WriteAllBytes(fileName, data ?? Array.Empty<byte>());
+
         private static string CleanupImportedLabel(string label)
         {
             string original = label.Trim();
@@ -1363,6 +1575,8 @@ namespace PS2Disassembler
 
                     _fileData = data;
                 }
+
+                UpdateDisassemblyChromeVisibility();
 
                 _hexRowCount = 1;
                 _hexViewOffset = 0;
@@ -1731,6 +1945,11 @@ namespace PS2Disassembler
             if (!EnsurePineConnected())
                 return "PINE unavailable.";
 
+            const int VerifyCutoff = 256;
+            bool verifyWrites = patches.Count <= VerifyCutoff;
+            if (!verifyWrites)
+                LogPine($"Large PINE patch batch ({patches.Count} patch(es)); skipping per-patch readback verification.");
+
             int failed = 0;
             foreach (var (addr, bytes) in patches)
             {
@@ -1739,15 +1958,18 @@ namespace PS2Disassembler
                 try
                 {
                     _pine.WriteMemory(addr, bytes);
-                    byte[] verify = _pine.ReadMemory(addr, bytes.Length);
-                    if (!verify.SequenceEqual(bytes))
+                    if (verifyWrites)
                     {
-                        failed++;
-                        LogPine($"Write verify mismatch at 0x{addr:X8}: wrote {BitConverter.ToString(bytes).Replace("-", "")} read {BitConverter.ToString(verify).Replace("-", "")}");
-                    }
-                    else
-                    {
-                        LogPine($"Write OK at 0x{addr:X8}: {BitConverter.ToString(bytes).Replace("-", "")}");
+                        byte[] verify = _pine.ReadMemory(addr, bytes.Length);
+                        if (!verify.SequenceEqual(bytes))
+                        {
+                            failed++;
+                            LogPine($"Write verify mismatch at 0x{addr:X8}: wrote {BitConverter.ToString(bytes).Replace("-", "")} read {BitConverter.ToString(verify).Replace("-", "")}");
+                        }
+                        else
+                        {
+                            LogPine($"Write OK at 0x{addr:X8}: {BitConverter.ToString(bytes).Replace("-", "")}");
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -1832,6 +2054,7 @@ namespace PS2Disassembler
                     if (_miDetach != null) _miDetach.Enabled = true;
                     _mainTabs.SetTabEnabled(2, true); // Enable Code Manager now that we're attached
                     _mainTabs.SetTabVisible(2, true);
+                    SyncMainViewMenuState();
                     _sbProgress.Text = _debugServerAvailable
                         ? (_pineAvailable ? "Attached to PCSX2 (PINE + debug server connected)." : "Attached to PCSX2 (debug server connected; PINE unavailable).")
                         : (_pineAvailable ? "Attached to PCSX2 (PINE connected; debug server unavailable)." : "Attached to PCSX2 (PINE unavailable; using process memory).");
@@ -1888,6 +2111,7 @@ namespace PS2Disassembler
 
             // Clear file/disassembly data
             _fileData = null;
+            UpdateDisassemblyChromeVisibility();
             _elfInfo = null;
             _fileName = "";
             _baseAddr = 0;
@@ -1941,6 +2165,7 @@ namespace PS2Disassembler
                 _mainTabs.SelectedIndex = 0;
             _mainTabs.SetTabEnabled(2, false);
             _mainTabs.SetTabVisible(2, false);
+            SyncMainViewMenuState();
 
             // Reset title and status
             Text = "ps2dis#";
@@ -2639,6 +2864,8 @@ namespace PS2Disassembler
             _baseAddr   = 0x00000000;
             _disasmBase = 0x00000000;
             _disasmLen  = (uint)eeMem.Length;
+
+            UpdateDisassemblyChromeVisibility();
 
             _hexRowCount = 1;
             _hexViewOffset = 0;

@@ -37,6 +37,7 @@ namespace PS2Disassembler
             T(dis, 0x00400013, "mtlo    v0");
             T(dis, 0x00621818, "mult    v1, v1, v0");
             T(dis, 0x00621819, "multu   v1, v1, v0");
+            T(dis, 0x01FF0019, "multu   t7, ra");
             T(dis, 0x00221025, "or      v0, at, v0");
             T(dis, 0x00221027, "nor     v0, at, v0");
             T(dis, 0x00021080, "sll     v0, v0, 2");
@@ -128,6 +129,7 @@ namespace PS2Disassembler
             T(dis, 0x70620000, "madd    zero, v1, v0");
             T(dis, 0x70220010, "mfhi1   v0");
             T(dis, 0x70620018, "mult1   zero, v1, v0");
+            T(dis, 0x70620019, "multu1  v1, v0");
 
             Console.WriteLine($"\nResults: {_pass} passed, {_fail} failed out of {_pass+_fail} tests.");
         }
