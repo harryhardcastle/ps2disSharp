@@ -85,7 +85,7 @@ namespace PS2Disassembler
                 ScrollBars = ScrollBars.Both,
                 ReadOnly = true,
                 WordWrap = false,
-                Font = new Font("Consolas", 9f),
+                Font = new Font("Tahoma", 8.25f),
                 BorderStyle = BorderStyle.None,
             };
 

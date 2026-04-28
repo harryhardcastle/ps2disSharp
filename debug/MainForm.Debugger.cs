@@ -179,7 +179,7 @@ namespace PS2Disassembler
                 {
                     ReadOnly = true,
                     BorderStyle = BorderStyle.FixedSingle,
-                    Font = _fprList.Font,
+                    Font = this.Font,
                 };
                 _regInlineEdit.KeyDown += (_, ke) =>
                 {
@@ -1555,6 +1555,48 @@ namespace PS2Disassembler
             RefreshAccessMonitorList();
         }
 
+        private string GetAccessMonitorWindowTitle()
+        {
+            return _accessMonitorAddressValid
+                ? $"Access Monitor - {_accessMonitorAddress:X8}"
+                : "Access Monitor";
+        }
+
+        private void UpdateAccessMonitorWindowState()
+        {
+            if (_accessMonitorForm != null && !_accessMonitorForm.IsDisposed)
+                _accessMonitorForm.Text = GetAccessMonitorWindowTitle();
+
+            if (_accessMonitorStatusLabel != null && !_accessMonitorStatusLabel.IsDisposed)
+            {
+                _accessMonitorStatusLabel.Text = _accessMonitorActive
+                    ? $"Monitoring {_accessMonitorAddress:X8}"
+                    : (_accessMonitorAddressValid ? $"Stopped. Last address {_accessMonitorAddress:X8}" : "Not monitoring.");
+            }
+
+            if (_accessMonitorGoToAddressButton != null && !_accessMonitorGoToAddressButton.IsDisposed)
+                _accessMonitorGoToAddressButton.Enabled = _accessMonitorAddressValid;
+        }
+
+        private void GoToAccessMonitorAddress()
+        {
+            if (!_accessMonitorAddressValid)
+                return;
+
+            if (_mainTabs != null)
+                _mainTabs.SelectedIndex = 0;
+
+            if (TryGetRowIndexByAddress(_accessMonitorAddress, out int rowIdx))
+            {
+                SelectRow(rowIdx, center: true);
+                _disasmList?.Focus();
+                return;
+            }
+
+            MessageBox.Show($"Address {_accessMonitorAddress:X8} is outside the loaded disassembly.",
+                "Access Monitor", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
         private void StartAccessMonitor(uint address)
         {
             if (!EnsureDebugServerConnected(forceRetry: true))
@@ -1595,6 +1637,7 @@ namespace PS2Disassembler
                 _accessMonitorMemcheckInstalled = true;
 
                 _accessMonitorAddress = address;
+                _accessMonitorAddressValid = true;
                 _accessMonitorActive = true;
                 _accessMonitorPassiveMode = false;
                 _accessMonitorNeedsRearm = false;
@@ -1661,7 +1704,8 @@ namespace PS2Disassembler
         {
             if (_accessMonitorForm != null && !_accessMonitorForm.IsDisposed)
             {
-                _accessMonitorForm.Text = "Access Monitor";
+                _accessMonitorForm.Text = GetAccessMonitorWindowTitle();
+                UpdateAccessMonitorWindowState();
                 ApplyThemeToControlTree(_accessMonitorForm);
                 ResizeAccessMonitorColumns();
                 ApplyThemeToWindowChrome(_accessMonitorForm, forceFrameRefresh: true);
@@ -1676,7 +1720,7 @@ namespace PS2Disassembler
 
             var frm = new Form
             {
-                Text = "Access Monitor",
+                Text = GetAccessMonitorWindowTitle(),
                 Width = 550,
                 Height = 400,
                 StartPosition = FormStartPosition.Manual,
@@ -1691,7 +1735,7 @@ namespace PS2Disassembler
 
             var statusLabel = new Label
             {
-                Text = _accessMonitorActive ? $"Monitoring {_accessMonitorAddress:X8}" : "Not monitoring.",
+                Text = _accessMonitorActive ? $"Monitoring {_accessMonitorAddress:X8}" : (_accessMonitorAddressValid ? $"Stopped. Last address {_accessMonitorAddress:X8}" : "Not monitoring."),
                 Dock = DockStyle.Fill,
                 AutoEllipsis = true,
                 TextAlign = ContentAlignment.MiddleLeft,
@@ -1734,7 +1778,7 @@ namespace PS2Disassembler
             var btnPanel = new FlowLayoutPanel
             {
                 Dock = DockStyle.Right,
-                Width = 164,
+                Width = 286,
                 FlowDirection = FlowDirection.RightToLeft,
                 WrapContents = false,
                 Padding = new Padding(4),
@@ -1759,8 +1803,13 @@ namespace PS2Disassembler
                 RefreshAccessMonitorList();
             };
 
+            var btnGoToAddress = new Button { Text = "Go to Address", Width = 110, FlatStyle = FlatStyle.Flat, ForeColor = _themeFormFore, BackColor = _themeFormBack, Enabled = _accessMonitorAddressValid };
+            btnGoToAddress.Click += (_, _) => GoToAccessMonitorAddress();
+            _accessMonitorGoToAddressButton = btnGoToAddress;
+
             btnPanel.Controls.Add(btnStop);
             btnPanel.Controls.Add(btnClear);
+            btnPanel.Controls.Add(btnGoToAddress);
 
             var bottomBar = new Panel
             {
@@ -1790,9 +1839,11 @@ namespace PS2Disassembler
                 _accessMonitorForm = null;
                 _accessMonitorList = null;
                 _accessMonitorStatusLabel = null;
+                _accessMonitorGoToAddressButton = null;
             };
 
             _accessMonitorForm = frm;
+            UpdateAccessMonitorWindowState();
             ApplyThemeToControlTree(frm);
             CenterOwnedWindowOnMainForm(frm);
             frm.Show(this);
@@ -1870,12 +1921,7 @@ namespace PS2Disassembler
             else if (sizeChanged)
                 _accessMonitorList.Invalidate();
 
-            if (_accessMonitorStatusLabel != null)
-            {
-                _accessMonitorStatusLabel.Text = _accessMonitorActive
-                    ? $"Monitoring {_accessMonitorAddress:X8}"
-                    : "Stopped.";
-            }
+            UpdateAccessMonitorWindowState();
         }
 
         private void SwitchAccessMonitorToBreakMode()

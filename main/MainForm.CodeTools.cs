@@ -93,6 +93,7 @@ namespace PS2Disassembler
                             codePanel.Controls.Add(innerTabs);
                             ApplyThemeToControlTree(codePanel);
                             ApplyScrollbarTheme(codePanel, _currentTheme == AppTheme.Dark);
+                            _codeToolsDlg.ApplyEditorScrollbarTheme(_currentTheme == AppTheme.Dark);
                         }
                         finally
                         {
@@ -610,6 +611,53 @@ namespace PS2Disassembler
             return null;
         }
 
+        private string? GetRegularLabelAt(uint addr)
+        {
+            // Only saved/user labels count as regular labels for visual object-label suffixes.
+            // Object labels should replace generated/temp labels (xref _, FUNC_, string labels, etc.),
+            // but append to real labels as Label#ObjectLabel.
+            return _userLabels.TryGetValue(addr, out var u) && !string.IsNullOrWhiteSpace(u) ? u : null;
+        }
+
+        private bool TryGetObjectLabelSuffixAt(uint addr, out string objectLabel)
+        {
+            if (_objectTempLabels.TryGetValue(addr, out var liveObjectLabel) && !string.IsNullOrWhiteSpace(liveObjectLabel))
+            {
+                objectLabel = liveObjectLabel.Trim();
+                return true;
+            }
+
+            // Object entry names can also annotate the static pointer address, but only as
+            // a suffix to an existing regular label. They are not standalone temp labels.
+            var staticDefinition = _objectLabelDefinitions.FirstOrDefault(x => x.StaticAddress == addr);
+            if (staticDefinition != null && !string.IsNullOrWhiteSpace(staticDefinition.Label))
+            {
+                objectLabel = staticDefinition.Label.Trim();
+                return true;
+            }
+
+            objectLabel = string.Empty;
+            return false;
+        }
+
+        private bool TryGetCombinedRegularObjectLabel(uint addr, out string regularLabel, out string objectLabel)
+        {
+            regularLabel = GetRegularLabelAt(addr) ?? string.Empty;
+            if (!string.IsNullOrWhiteSpace(regularLabel) && TryGetObjectLabelSuffixAt(addr, out objectLabel))
+                return true;
+
+            objectLabel = string.Empty;
+            return false;
+        }
+
+        private string? GetDisplayLabelAt(uint addr)
+        {
+            if (TryGetCombinedRegularObjectLabel(addr, out string regularLabel, out string objectLabel))
+                return $"{regularLabel}#{objectLabel}";
+
+            return GetLabelAt(addr);
+        }
+
         /// <summary>
         /// Like <see cref="GetLabelAt"/> but excludes transient xref/temp labels.
         /// Used for instruction Command-column annotations so that only saved labels
@@ -707,7 +755,7 @@ namespace PS2Disassembler
                 _inlineEdit = new TextBox
                 {
                     BorderStyle = BorderStyle.FixedSingle,
-                    Font        = _mono,
+                    Font        = GetStandardTextBoxFont(),
                     BackColor   = _themeEditValidBack,
                     ForeColor   = _themeWindowFore,
                 };
@@ -746,10 +794,10 @@ namespace PS2Disassembler
                 var r = ResolveRowForDisplay(slim);
                 return r.Mnemonic switch
                 {
-                    ".word"  => FormatWordValue(r.Word),
-                    ".half"  => r.Operands,
-                    ".byte"  => r.Operands,
-                    ".float" => r.Operands,
+                    ".word"  => FormatWordValue(r.Word).Replace(AnnotationSentinel.ToString(), string.Empty),
+                    ".half"  => r.Operands.Replace(AnnotationSentinel.ToString(), string.Empty),
+                    ".byte"  => r.Operands.Replace(AnnotationSentinel.ToString(), string.Empty),
+                    ".float" => r.Operands.Replace(AnnotationSentinel.ToString(), string.Empty),
                     _         => NormalizeCommandAddressPrefixes($"{r.Mnemonic} {r.Operands}".Trim()),
                 };
             }
@@ -1128,7 +1176,7 @@ namespace PS2Disassembler
             using var dlg = new InputDialog(
                 "Add / Edit Label",
                 $"Label for 0x{addr:X8} (leave blank to remove):",
-                GetLabelAt(addr) ?? "");
+                GetRegularLabelAt(addr) ?? "");
             dlg.BackColor = _themeFormBack;
             dlg.ForeColor = _themeFormFore;
             ApplyThemeToControlTree(dlg);
@@ -1245,7 +1293,7 @@ namespace PS2Disassembler
             _tb = new TextBox
             {
                 Text = initial, Location = new Point(12, 34),
-                Width = 350, Font = new Font("Courier New", 10f),
+                Width = 350,
             };
             _tb.KeyDown += (_, e) => { if (e.KeyCode == Keys.Enter) { DialogResult = DialogResult.OK; Close(); } };
             Controls.Add(_tb);
@@ -1282,7 +1330,6 @@ namespace PS2Disassembler
                 Text = normalizedInitial,
                 Location = new Point(8, 6),
                 Width = ClientSize.Width - 16,
-                Font = new Font("Courier New", 10f),
                 BorderStyle = BorderStyle.FixedSingle,
                 CharacterCasing = CharacterCasing.Upper,
                 MaxLength = 8,
@@ -1706,10 +1753,18 @@ namespace PS2Disassembler
             {
                 if (c is Button btn)
                 {
-                    btn.BackColor = formBack;
+                    Color buttonBack = Color.FromArgb(formBack.A,
+                        Math.Min(255, (int)Math.Round(formBack.R * 1.20f)),
+                        Math.Min(255, (int)Math.Round(formBack.G * 1.20f)),
+                        Math.Min(255, (int)Math.Round(formBack.B * 1.20f)));
+                    btn.BackColor = buttonBack;
                     btn.ForeColor = formFore;
                     btn.FlatStyle = FlatStyle.Flat;
                     btn.FlatAppearance.BorderColor = windowFore;
+                    btn.FlatAppearance.MouseOverBackColor = Color.FromArgb(buttonBack.A,
+                        Math.Min(255, (int)Math.Round(buttonBack.R * 1.20f)),
+                        Math.Min(255, (int)Math.Round(buttonBack.G * 1.20f)),
+                        Math.Min(255, (int)Math.Round(buttonBack.B * 1.20f)));
                 }
                 if (c is Label lbl && lbl != _countLabel)
                     lbl.ForeColor = formFore;
@@ -1892,6 +1947,7 @@ namespace PS2Disassembler
         private int _constantWriteRateDisplay = AppSettings.DefaultConstantWriteRate;
         private readonly System.Windows.Forms.Timer _activeCodesTimer;
         private string _activeCodesText = string.Empty;
+        private bool _darkEditorScrollbars = true;
 
         // ── Search tab fields ────────────────────────────────────────────
         private readonly Func<(byte[]? Ram, string? Err)> _readEeRam;
@@ -1993,7 +2049,12 @@ namespace PS2Disassembler
                 DetectUrls = false
             };
             codesSurface.Controls.Add(_tbCodes);
-            _tbCodes.HandleCreated += (_, _) => NativeMethods.SetRichTextBoxPadding(_tbCodes, 5);
+            _tbCodes.ContextMenuStrip = CreateEditorContextMenu(_tbCodes);
+            _tbCodes.HandleCreated += (_, _) =>
+            {
+                NativeMethods.SetRichTextBoxPadding(_tbCodes, 5);
+                ApplyEditorScrollbarTheme(_tbCodes);
+            };
             _tbCodes.Resize += (_, _) => NativeMethods.SetRichTextBoxPadding(_tbCodes, 5);
             var btnUpdateCodes = new Button
             {
@@ -2032,7 +2093,12 @@ namespace PS2Disassembler
                 DetectUrls = false
             };
             injectSurface.Controls.Add(_tbInject);
-            _tbInject.HandleCreated += (_, _) => NativeMethods.SetRichTextBoxPadding(_tbInject, 5);
+            _tbInject.ContextMenuStrip = CreateEditorContextMenu(_tbInject);
+            _tbInject.HandleCreated += (_, _) =>
+            {
+                NativeMethods.SetRichTextBoxPadding(_tbInject, 5);
+                ApplyEditorScrollbarTheme(_tbInject);
+            };
             _tbInject.Resize += (_, _) => NativeMethods.SetRichTextBoxPadding(_tbInject, 5);
             var btnUpdateInject = new Button
             {
@@ -2203,6 +2269,53 @@ namespace PS2Disassembler
                     Hide();
                 }
             };
+        }
+
+        public void ApplyEditorScrollbarTheme(bool dark)
+        {
+            _darkEditorScrollbars = dark;
+            ApplyEditorScrollbarTheme(_tbCodes);
+            ApplyEditorScrollbarTheme(_tbInject);
+        }
+
+        private void ApplyEditorScrollbarTheme(RichTextBox editor)
+        {
+            if (editor == null || !editor.IsHandleCreated)
+                return;
+
+            try
+            {
+                string theme = _darkEditorScrollbars ? "DarkMode_Explorer" : "";
+                NativeMethods.SetWindowTheme(editor.Handle, theme, null);
+                NativeMethods.SendMessage(editor.Handle, NativeMethods.WM_THEMECHANGED, IntPtr.Zero, IntPtr.Zero);
+                NativeMethods.RedrawWindow(editor.Handle, IntPtr.Zero, IntPtr.Zero,
+                    NativeMethods.RDW_INVALIDATE | NativeMethods.RDW_UPDATENOW | NativeMethods.RDW_FRAME | NativeMethods.RDW_ALLCHILDREN);
+            }
+            catch { }
+        }
+
+        private static ContextMenuStrip CreateEditorContextMenu(RichTextBox editor)
+        {
+            var menu = new ContextMenuStrip();
+            var miCopy = new ToolStripMenuItem("Copy", null, (_, _) =>
+            {
+                if (editor.SelectionLength > 0)
+                    editor.Copy();
+            });
+            var miPaste = new ToolStripMenuItem("Paste", null, (_, _) =>
+            {
+                if (Clipboard.ContainsText())
+                    editor.Paste();
+            });
+
+            menu.Items.Add(miCopy);
+            menu.Items.Add(miPaste);
+            menu.Opening += (_, _) =>
+            {
+                miCopy.Enabled = editor.SelectionLength > 0;
+                miPaste.Enabled = Clipboard.ContainsText();
+            };
+            return menu;
         }
 
         public void SelectTab(int index)
@@ -2878,7 +2991,6 @@ namespace PS2Disassembler
             {
                 Location = new Point(12, 30),
                 Width = 386,
-                Font = new Font("Cascadia Code", 10f),
                 BorderStyle = BorderStyle.FixedSingle,
             };
             _txtSearch.KeyDown += (_, e) =>
@@ -2943,6 +3055,7 @@ namespace PS2Disassembler
         private readonly MainForm.FlatComboBox _cbFont;
         private readonly MainForm.FlatComboBox _cbFontSize;
         private readonly MainForm.FlatComboBox _cbTheme;
+        private readonly MainForm.FlatComboBox _cbRowSpacing;
         private readonly MainForm.FlatComboBox _cbRefreshRate;
         private readonly MainForm.FlatComboBox _cbConstantWriteRate;
         private readonly CheckBox _chkShowMemoryView;
@@ -2959,6 +3072,7 @@ namespace PS2Disassembler
             System.Globalization.NumberStyles.Float,
             System.Globalization.CultureInfo.InvariantCulture, out float v) && v >= 6f && v <= 30f ? v : AppSettings.DefaultFontSize;
         public string SelectedTheme => _cbTheme.SelectedItem?.ToString() ?? AppSettings.DefaultTheme;
+        public string SelectedRowSpacing => AppSettings.NormalizeRowSpacing(_cbRowSpacing.SelectedItem?.ToString() ?? _cbRowSpacing.Text);
         public int SelectedRefreshRate => int.TryParse(_cbRefreshRate.SelectedItem?.ToString(), out int v) && AppSettings.IsSupportedRefreshRate(v)
             ? v
             : AppSettings.DefaultRefreshRate;
@@ -2978,7 +3092,7 @@ namespace PS2Disassembler
             const int optionsButtonStripHeight = 42;
             const int optionsTabStripHeight = 24;
             const int optionsContentBottomPadding = 12;
-            const int optionsContentHeight = 156 + 2 + 20 + optionsContentBottomPadding;
+            const int optionsContentHeight = 190 + 2 + 20 + optionsContentBottomPadding;
             Size optionsClientSize = new Size(optionsTabCount * optionsTabButtonWidth, optionsTabStripHeight + optionsContentHeight + optionsButtonStripHeight);
 
             Text = $"Options - Version {AppSettings.AppVersion}";
@@ -3088,7 +3202,21 @@ namespace PS2Disassembler
             SelectComboItem(_cbTheme, settings.Theme, AppSettings.DefaultTheme);
             pnlUi.Controls.Add(_cbTheme);
 
-            int showMemoryRowY = themeRowY + rowH;
+            int rowSpacingRowY = themeRowY + rowH;
+            pnlUi.Controls.Add(new Label { Text = "Row Spacing:", Location = new Point(innerLabelX, rowSpacingRowY + 3), AutoSize = true });
+            _cbRowSpacing = new MainForm.FlatComboBox
+            {
+                Location = new Point(innerControlX, rowSpacingRowY),
+                Width = innerControlW,
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                TabStop = true,
+            };
+            foreach (string spacing in AppSettings.SupportedRowSpacings)
+                _cbRowSpacing.Items.Add(spacing);
+            SelectComboItem(_cbRowSpacing, AppSettings.NormalizeRowSpacing(settings.RowSpacing), AppSettings.DefaultRowSpacing);
+            pnlUi.Controls.Add(_cbRowSpacing);
+
+            int showMemoryRowY = rowSpacingRowY + rowH;
             _chkShowMemoryView = new MainForm.ThemedCheckBox
             {
                 Text = "Show Memory View",
@@ -3200,6 +3328,7 @@ namespace PS2Disassembler
                     AppSettings.DefaultFontSize.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture),
                     AppSettings.DefaultFontSize.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture));
                 SelectComboItem(_cbTheme, AppSettings.DefaultTheme, AppSettings.DefaultTheme);
+                SelectComboItem(_cbRowSpacing, AppSettings.DefaultRowSpacing, AppSettings.DefaultRowSpacing);
                 SelectComboItem(_cbRefreshRate,
                     AppSettings.DefaultRefreshRate.ToString(System.Globalization.CultureInfo.InvariantCulture),
                     AppSettings.DefaultRefreshRate.ToString(System.Globalization.CultureInfo.InvariantCulture));

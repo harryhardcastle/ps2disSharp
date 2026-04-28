@@ -147,6 +147,8 @@ namespace PS2Disassembler
         private FindDialog? _findDialog;
         private VirtualDisasmList? _accessMonitorList;
         private Label? _accessMonitorStatusLabel;
+        private Button? _accessMonitorGoToAddressButton;
+        private bool _accessMonitorAddressValid;
         private sealed class AccessMonitorRow
         {
             public uint Pc;
@@ -258,7 +260,10 @@ namespace PS2Disassembler
         private ToolStripMenuItem?            _miDisassemblerMenu;
         private ToolStripMenuItem?            _miMainMemoryViewMenu;
         private ToolStripMenuItem?            _miCodeManagerMenu;
+        private ToolStripMenuItem?            _miCodeDesignerMenu;
         private ToolStripMenuItem?            _miGoToMemoryView;
+        private FlatTabPage?                 _codeDesignerPage;
+        private CodeDesignerWorkspace?       _codeDesignerWorkspace;
         private readonly StatusStrip          _statusStrip;
         private readonly ToolStripStatusLabel _sbInfo;
         private readonly ToolStripStatusLabel _sbAddr;
@@ -279,11 +284,15 @@ namespace PS2Disassembler
         private ToolStripMenuItem?            _miCtxSetWriteBreakpoint;
         private ToolStripMenuItem?            _miCtxClearBreakpoints;
         private ToolStripMenuItem?            _miCtxMonitorAccess;
+        private ToolStripMenuItem?            _miCtxObjectLabels;
+        private ToolStripMenuItem?            _miCtxDefineObject;
+        private ToolStripMenuItem?            _miCtxAddObjectLabel;
         private ToolStripMenuItem?            _miCtxNopOpcode;
         private ToolStripMenuItem?            _miCtxRestoreOriginalOpcode;
         private ToolStripSeparator?           _miCtxEditSeparator;
         private ToolStripSeparator?           _miCtxBreakpointSeparator;
         private ToolStripSeparator?           _miCtxMonitorSeparator;
+        private ToolStripSeparator?           _miCtxObjectLabelSeparator;
         private SplitContainer?               _disasmBreakpointSplit;
         private Panel?                        _breakpointsPanel;
         private int                           _breakpointSidebarPreferredWidth = BreakpointSidebarFixedWidth;
@@ -299,12 +308,16 @@ namespace PS2Disassembler
         private VirtualDisasmList?            _fprList;
         private readonly List<(string Reg, string Value, bool IsFloat)> _fprRows = new();
         private readonly System.Windows.Forms.Timer _activityStatusResetTimer;
+        private System.Windows.Forms.Timer?   _titleBarStatusDrawTimer;
+        private TitleBarStatusOverlay?        _titleBarStatusOverlay;
         private Font?                         _menuStatusBoldFont;
         private bool                          _menuPauseStatusActive;
         private string                        _menuPauseStatusSavedText = "Ready";
         private Color                         _menuPauseStatusSavedColor = SystemColors.ControlText;
         private Font?                         _menuPauseStatusSavedFont;
         private bool _addrIndexDirty = false;
+        private string _baseTitleText = "ps2dis#";
+        private string _titleBarStatusText = "Ready";
         private const int AddrIndexMaxRows = 250000;
         private const int BreakpointSidebarMainMinWidth = 260; //260
         private const int BreakpointSidebarPanelMinWidth = 160; //220
@@ -403,9 +416,9 @@ namespace PS2Disassembler
         public MainForm(string? startFile = null)
         {
             SuspendLayout();
-            Text          = "ps2dis#";
+            Text          = _baseTitleText;
             Size          = new Size(900, 700); //1120, 740
-            MinimumSize   = new Size(600, 400); //700, 500
+            MinimumSize   = new Size(780, 400); // keep Code Designer toolbar controls visible
             StartPosition = FormStartPosition.CenterScreen;
             Font          = new Font("Tahoma", 8.25f);
             AllowDrop     = true;
@@ -479,6 +492,8 @@ namespace PS2Disassembler
             _miMainMemoryViewMenu.Click += (_, _) => ActivateMainViewTab(1);
             _miCodeManagerMenu = new ToolStripMenuItem("Code Manager") { Enabled = false, Visible = false };
             _miCodeManagerMenu.Click += (_, _) => ActivateMainViewTab(2);
+            _miCodeDesignerMenu = new ToolStripMenuItem("Code Designer");
+            _miCodeDesignerMenu.Click += (_, _) => ActivateMainViewTab(3);
 
             var breakpointsMenu = new ToolStripMenuItem("Breakpoints");
             _miBreakpointsMenu = breakpointsMenu;
@@ -512,7 +527,8 @@ namespace PS2Disassembler
                 Width = 420,
                 Overflow = ToolStripItemOverflow.Never,
                 TextAlign = ContentAlignment.MiddleRight,
-                Margin = new Padding(0, 1, 6, 2)
+                Margin = new Padding(0, 1, 6, 2),
+                Visible = false
             };
             _menuStatusBoldFont = new Font(_menuStatusLabel.Font ?? Font, FontStyle.Bold);
             _menuPauseStatusSavedFont = _menuStatusLabel.Font;
@@ -524,16 +540,24 @@ namespace PS2Disassembler
                 if (!IsDisposed && _menuStatusLabel.Text != "Ready")
                     SetActivityStatus("Ready");
             };
+            _titleBarStatusDrawTimer = new System.Windows.Forms.Timer { Interval = 80 };
+            _titleBarStatusDrawTimer.Tick += (_, _) =>
+            {
+                _titleBarStatusDrawTimer.Stop();
+                DrawTitleBarStatusText();
+                UpdateTitleBarStatusOverlay();
+            };
 
-            foreach (ToolStripItem topLevelItem in new ToolStripItem[] { fileMenu, editMenu, viewMenu, anaMenu, _miDisassemblerMenu, _miMainMemoryViewMenu, _miCodeManagerMenu, breakpointsMenu })
+            foreach (ToolStripItem topLevelItem in new ToolStripItem[] { fileMenu, editMenu, viewMenu, anaMenu, _miDisassemblerMenu, _miMainMemoryViewMenu, _miCodeManagerMenu, _miCodeDesignerMenu, breakpointsMenu })
             {
                 topLevelItem.Margin = Padding.Empty;
             }
 
             _menuBar.Items.AddRange(new ToolStripItem[]
-                { fileMenu, editMenu, viewMenu, anaMenu, _miDisassemblerMenu, _miMainMemoryViewMenu, _miCodeManagerMenu, breakpointsMenu, _menuStatusSpring, _menuStatusLabel });
+                { fileMenu, editMenu, viewMenu, anaMenu, _miDisassemblerMenu, _miMainMemoryViewMenu, _miCodeManagerMenu, _miCodeDesignerMenu, breakpointsMenu });
             MainMenuStrip = _menuBar;
             _menuBar.MouseDown += OnMenuBarMouseDown;
+            _menuBar.Paint += OnMenuBarPaintStatus;
             _menuBar.SizeChanged += (_, _) => UpdateMenuStatusLayout();
             UpdateMenuStatusLayout();
             SyncMainViewMenuState();
@@ -630,10 +654,17 @@ namespace PS2Disassembler
             ctx.Items.Add(_miCtxSetReadBreakpoint);
             ctx.Items.Add(_miCtxSetWriteBreakpoint);
             ctx.Items.Add(_miCtxClearBreakpoints);
-            _miCtxMonitorSeparator = new ToolStripSeparator();
-            ctx.Items.Add(_miCtxMonitorSeparator);
+            _miCtxMonitorSeparator = null;
             _miCtxMonitorAccess = new ToolStripMenuItem("Monitor Access", null, (_, _) => StartAccessMonitorOnSelectedRow());
             ctx.Items.Add(_miCtxMonitorAccess);
+            _miCtxObjectLabelSeparator = new ToolStripSeparator();
+            ctx.Items.Add(_miCtxObjectLabelSeparator);
+            _miCtxObjectLabels = new ToolStripMenuItem("Object Labels");
+            _miCtxDefineObject = new ToolStripMenuItem("Define Object", null, (_, _) => DefineObjectFromSelectedRow());
+            _miCtxAddObjectLabel = new ToolStripMenuItem("Add/Edit Object Label", null, (_, _) => AddObjectLabelFromSelectedRow());
+            _miCtxObjectLabels.DropDownItems.Add(_miCtxDefineObject);
+            _miCtxObjectLabels.DropDownItems.Add(_miCtxAddObjectLabel);
+            ctx.Items.Add(_miCtxObjectLabels);
             ctx.Opening += (_, _) =>
             {
                 bool attached = IsLiveAttached();
@@ -642,20 +673,37 @@ namespace PS2Disassembler
                 if (_miCtxEditSeparator != null) _miCtxEditSeparator.Visible = hasSelection;
                 if (_miCtxNopOpcode != null) _miCtxNopOpcode.Enabled = hasSelection;
                 if (_miCtxRestoreOriginalOpcode != null)
-                {
                     _miCtxRestoreOriginalOpcode.Enabled = hasSelection && HasOriginalOpcodeForAddress(_rows[_selRow].Address);
-                }
                 if (_miCtxBreakpointSeparator != null) _miCtxBreakpointSeparator.Visible = attached;
                 if (_miCtxSetPcBreakpoint != null) _miCtxSetPcBreakpoint.Visible = attached;
                 if (_miCtxSetReadBreakpoint != null) _miCtxSetReadBreakpoint.Visible = attached;
                 if (_miCtxSetWriteBreakpoint != null) _miCtxSetWriteBreakpoint.Visible = attached;
                 if (_miCtxClearBreakpoints != null) _miCtxClearBreakpoints.Visible = attached;
-                if (_miCtxMonitorSeparator != null) _miCtxMonitorSeparator.Visible = attached;
-                if (_miCtxMonitorAccess != null) _miCtxMonitorAccess.Visible = attached;
+                if (_miCtxMonitorAccess != null)
+                {
+                    _miCtxMonitorAccess.Visible = attached;
+                    _miCtxMonitorAccess.Enabled = hasSelection;
+                }
+                if (_miCtxObjectLabelSeparator != null) _miCtxObjectLabelSeparator.Visible = attached;
+                if (_miCtxObjectLabels != null)
+                {
+                    _miCtxObjectLabels.Visible = attached;
+                    _miCtxObjectLabels.Enabled = hasSelection;
+                }
+                if (_miCtxDefineObject != null)
+                {
+                    _miCtxDefineObject.Visible = attached;
+                    _miCtxDefineObject.Enabled = hasSelection;
+                }
+                if (_miCtxAddObjectLabel != null)
+                {
+                    _miCtxAddObjectLabel.Visible = attached;
+                    _miCtxAddObjectLabel.Enabled = hasSelection;
+                }
             };
             _disasmList.ContextMenuStrip = ctx;
 
-            // ── Main Tabs: Disassembler | Memory View | Code Manager ─
+            // ── Main Tabs: Disassembler | Memory View | Code Manager | Code Designer ─
             _mainTabs = new FlatTabHost
             {
                 Dock = DockStyle.Fill,
@@ -698,14 +746,18 @@ namespace PS2Disassembler
                 // Lazy-init Code Manager on first visit — avoids allocating the dialog at startup
                 if (idx == 2)
                     BeginInvoke((Action)(() => EnsureCodeToolsDialog()));
+                if (idx == 3)
+                    BeginInvoke((Action)(() => EnsureCodeDesignerWorkspace()));
             };
 
             var tpDisasm  = new FlatTabPage("Disassembler") { Padding = new Padding(0), Margin = new Padding(0) };
             _memoryViewPage = new FlatTabPage("Memory View") { Padding = new Padding(0), Margin = new Padding(0) };
             var tpCodes   = new FlatTabPage("Code Manager") { Padding = new Padding(0), Margin = new Padding(0), Tag = "CodeManagerHostPage" };
+            _codeDesignerPage = new FlatTabPage("Code Designer") { Padding = new Padding(0), Margin = new Padding(0), Tag = "CodeDesignerHostPage" };
             _mainTabs.AddPage(tpDisasm);
             _mainTabs.AddPage(_memoryViewPage);
             _mainTabs.AddPage(tpCodes);
+            _mainTabs.AddPage(_codeDesignerPage);
             _mainTabs.SetTabEnabled(2, false); // Code Manager disabled until attached to PCSX2
             _mainTabs.SetTabVisible(2, false); // and invisible until attached
 
@@ -782,7 +834,8 @@ namespace PS2Disassembler
                 ApplyScrollbarTheme(this, _currentTheme == AppTheme.Dark);
                 RefreshTitleBarTheme(forceFrameRefresh: true);
             };
-            Resize    += (_, _) => AdjustHexSplitter();
+            Resize    += (_, _) => { AdjustHexSplitter(); UpdateMenuStatusLayout(); };
+            Move      += (_, _) => { };
             _disasmList.Resize += (_, _) => UpdateDisassemblyColumnWidths();
             _hexList.Resize    += (_, _) => AdjustHexSplitter();
 
@@ -852,6 +905,13 @@ namespace PS2Disassembler
                 _miCodeManagerMenu.Enabled = showCodeManager;
                 _miCodeManagerMenu.Checked = showTabsInTitleBar && showCodeManager && selectedIndex == 2;
             }
+
+            if (_miCodeDesignerMenu != null)
+            {
+                _miCodeDesignerMenu.Visible = true;
+                _miCodeDesignerMenu.Enabled = true;
+                _miCodeDesignerMenu.Checked = selectedIndex == 3;
+            }
         }
 
 
@@ -861,5 +921,6 @@ namespace PS2Disassembler
         // - MainForm.FileAndLive.cs
         // - MainForm.Disassembly.cs
         // - MainForm.CodeTools.cs
+        // - MainForm.CodeDesigner.cs
     }
 }

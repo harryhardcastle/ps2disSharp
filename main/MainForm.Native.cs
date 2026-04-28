@@ -112,6 +112,15 @@ namespace PS2Disassembler
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool DrawMenuBar(IntPtr hWnd);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr GetWindowDC(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
         [DllImport("dwmapi.dll")]
         public static extern int DwmFlush();
 
@@ -131,6 +140,8 @@ namespace PS2Disassembler
         public const int WM_THEMECHANGED = 0x031A;
         public const int WM_DWMCOMPOSITIONCHANGED = 0x031E;
         public const int WM_NCPAINT = 0x0085;
+        public const int WM_SETTEXT = 0x000C;
+        public const int WM_SIZE = 0x0005;
 
         public const uint EM_GETFIRSTVISIBLELINE = 0x00CE;
         public const uint EM_LINESCROLL = 0x00B6;

@@ -760,7 +760,7 @@ namespace PS2Disassembler
             if (_showBytes) item.SubItems.Add(r.BytesStr);
 
             string command = GetCommandText(r, e.ItemIndex).Replace(AnnotationSentinel.ToString(), string.Empty);
-            item.SubItems.Add(GetLabelAt(r.Address) ?? "");
+            item.SubItems.Add(GetDisplayLabelAt(r.Address) ?? "");
             item.SubItems.Add(command);
             EnsureVirtualItemHasAllSubItems(_disasmList, item);
             e.Item = item;
@@ -1102,7 +1102,9 @@ namespace PS2Disassembler
             {
                 mainText = text[..sentinel];
                 annotation = text[(sentinel + 1)..]; // skip sentinel char
-                return annotation.Length > 0;
+                // Treat even an empty annotation as a successful split so the
+                // sentinel never falls back into the visible text on highlighted rows.
+                return true;
             }
 
             // ── Fallback heuristics for text not produced by our annotation helpers ──
@@ -1241,7 +1243,7 @@ namespace PS2Disassembler
                 c++;
             }
             if (columnIndex == c)
-                return GetLabelAt(r.Address) ?? string.Empty;
+                return GetDisplayLabelAt(r.Address) ?? string.Empty;
             if (columnIndex == c + 1)
                 return GetCommandText(r, rowIndex);
             return string.Empty;
@@ -1266,6 +1268,8 @@ namespace PS2Disassembler
         private static void DrawSegment(Graphics g, string text, Font font, Color color,
             ref int x, Rectangle rowRect, TextFormatFlags baseFlags, bool last)
         {
+            if (!string.IsNullOrEmpty(text) && text.IndexOf(AnnotationSentinel) >= 0)
+                text = text.Replace(AnnotationSentinel.ToString(), string.Empty);
             if (string.IsNullOrEmpty(text) || x >= rowRect.Right) return;
             var avail = new Rectangle(x, rowRect.Y, rowRect.Right - x, rowRect.Height);
             if (last)
@@ -1280,6 +1284,28 @@ namespace PS2Disassembler
                 x += sz.Width;
             }
         }
+        private static Color BlendTextColor(Color fore, Color back, float alpha)
+        {
+            alpha = Math.Max(0f, Math.Min(1f, alpha));
+            return Color.FromArgb(
+                (int)Math.Round((fore.R * alpha) + (back.R * (1f - alpha))),
+                (int)Math.Round((fore.G * alpha) + (back.G * (1f - alpha))),
+                (int)Math.Round((fore.B * alpha) + (back.B * (1f - alpha))));
+        }
+
+        private void DrawCombinedLabelText(Graphics graphics, Rectangle bounds, string regularLabel, string objectLabel, Color rowBack, bool selectedLike)
+        {
+            var rect = bounds;
+            rect.Offset(0, DisasmTextVerticalOffset);
+            var flags = TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding;
+            int x = rect.X;
+
+            Color regularColor = selectedLike ? ColSelFg : ColLabel;
+            Color objectColor = BlendTextColor(selectedLike ? ColSelFg : ColLabel, rowBack, 0.50f);
+            DrawSegment(graphics, regularLabel, _mono, regularColor, ref x, rect, flags, last: false);
+            DrawSegment(graphics, "#" + objectLabel, _mono, objectColor, ref x, rect, flags, last: true);
+        }
+
 
         private void DrawFormattedCommandText(Graphics graphics, Rectangle bounds, string text, bool selected,
             Color defaultColor, Color selectedTextColor, Color annotationColor)
@@ -1289,12 +1315,14 @@ namespace PS2Disassembler
             var flags = TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding;
             int x = rect.X;
             bool forceSelectedColors = selected;
-            Color baseCommandColor = forceSelectedColors ? selectedTextColor : ColAddr;
+            Color baseCommandColor = forceSelectedColors ? selectedTextColor : defaultColor;
             Color annotColor = forceSelectedColors ? selectedTextColor : annotationColor;
 
-            TrySplitCommandAnnotation(text, out string mainText, out string annotation);
-            if (string.IsNullOrEmpty(annotation))
+            bool splitAtAnnotationBoundary = TrySplitCommandAnnotation(text, out string mainText, out string annotation);
+            if (string.IsNullOrEmpty(annotation) && !splitAtAnnotationBoundary)
                 mainText = text;
+            mainText = mainText.Replace(AnnotationSentinel.ToString(), string.Empty);
+            annotation = annotation.Replace(AnnotationSentinel.ToString(), string.Empty);
 
             bool useTabStop = !string.IsNullOrWhiteSpace(mainText) && !mainText.StartsWith(".", StringComparison.Ordinal);
             int spacePos = useTabStop ? mainText.IndexOf(' ') : -1;
@@ -1350,6 +1378,7 @@ namespace PS2Disassembler
             bool sel = idx == _selRow;
             bool isDest = !sel && idx == _highlightDestIdx;
             var r = GetLiveDisplayRow(idx);
+            DataKind displayDataKind = SlimRow.DataKindFromMnemonic(r.Mnemonic);
             bool isXref = r.Address == _xrefTarget && _xrefTarget != 0;
             bool hasBreakpoint = _userBreakpoints.Contains(r.Address);
             bool isActiveBreakpoint = _activeBreakpointAddress.HasValue && NormalizeMipsAddress(_activeBreakpointAddress.Value) == r.Address;
@@ -1397,7 +1426,7 @@ namespace PS2Disassembler
 
                 // Word/halfword datatypes: dim the decimal value in parentheses while preserving
                 // any trailing annotation label exactly as-is, even when it contains spaces/numbers.
-                if ((_rows[idx].DataSub == DataKind.Word || _rows[idx].DataSub == DataKind.Half) && !forceWhite)
+                if ((displayDataKind == DataKind.Word || displayDataKind == DataKind.Half) && !forceWhite)
                 {
                     int parenPos = mainText.IndexOf('(');
                     if (parenPos > 0)
@@ -1427,10 +1456,14 @@ namespace PS2Disassembler
                 }
 
                 DrawFormattedCommandText(graphics, rect, rawCellText, forceWhite,
-                    defaultColor: ColAddr,
+                    defaultColor: displayDataKind != DataKind.None ? ColData : ColAddr,
                     selectedTextColor: ColSelFg,
                     annotationColor: annotColor);
                 doneCmd:;
+            }
+            else if (!isInlineEditingThisCell && columnIndex == LblCol && TryGetCombinedRegularObjectLabel(r.Address, out string regularLabel, out string objectLabel))
+            {
+                DrawCombinedLabelText(graphics, rect, regularLabel, objectLabel, rowBack, sel || hasBreakpoint || isActiveBreakpoint);
             }
             else
             {
@@ -2260,6 +2293,73 @@ namespace PS2Disassembler
             {
                 _disasmList.EndUpdate();
                 _reinterpretNesting = Math.Max(0, _reinterpretNesting - 1);
+            }
+        }
+
+        private void ConvertAddressToWordData(uint address)
+        {
+            if (_fileData == null || _fileData.Length == 0)
+                return;
+
+            uint aligned = address & ~3u;
+            long off = (long)(aligned - _baseAddr);
+            if (off < 0 || off + 4 > _fileData.Length)
+                return;
+
+            if (!TryGetRowIndexByAddress(aligned, out int firstIdx))
+                return;
+
+            int count = 0;
+            while (firstIdx + count < _rows.Count &&
+                   _rows[firstIdx + count].Address >= aligned &&
+                   _rows[firstIdx + count].Address < aligned + 4)
+            {
+                count++;
+            }
+
+            if (count == 0)
+                return;
+
+            if (count == 1 && _rows[firstIdx].Address == aligned && _rows[firstIdx].DataSub == DataKind.Word)
+                return;
+
+            uint word = BitConverter.ToUInt32(_fileData, (int)off);
+            bool selectedInsideConvertedWord = _selRow >= 0 && _selRow < _rows.Count &&
+                _rows[_selRow].Address >= aligned && _rows[_selRow].Address < aligned + 4;
+
+            _disasmList.BeginUpdate();
+            try
+            {
+                _rows.RemoveRange(firstIdx, count);
+                _rows.Insert(firstIdx, SlimRow.DataRow(aligned, word, DataKind.Word));
+                _addrIndexDirty = true;
+
+                if (_disasmList.VirtualListSize != _rows.Count)
+                    _disasmList.VirtualListSize = _rows.Count;
+
+                if (selectedInsideConvertedWord)
+                {
+                    _selRow = firstIdx;
+                    _disasmList.SelectedIndexChanged -= OnDisasmSelChanged;
+                    try
+                    {
+                        _disasmList.SelectedIndices.Clear();
+                        if (firstIdx >= 0 && firstIdx < _rows.Count)
+                            _disasmList.SelectedIndices.Add(firstIdx);
+                    }
+                    finally
+                    {
+                        _disasmList.SelectedIndexChanged += OnDisasmSelChanged;
+                    }
+                    UpdateSel(firstIdx, syncHex: false);
+                }
+
+                if (firstIdx >= 0 && firstIdx < _rows.Count)
+                    _disasmList.RedrawItems(firstIdx, firstIdx, true);
+            }
+            finally
+            {
+                _disasmList.EndUpdate();
             }
         }
 

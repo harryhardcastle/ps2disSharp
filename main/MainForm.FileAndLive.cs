@@ -799,6 +799,7 @@ namespace PS2Disassembler
             _originalOpCode = new Dictionary<uint, uint>();
             _cachedLabels = new List<(string Name, uint Address)>();
             ClearObjectLabelState(clearDefinitions: true);
+            _objectLabelsAvailableFromProject = false;
             _currentProjectPath = null;
         }
 
@@ -821,8 +822,10 @@ namespace PS2Disassembler
 
                 int imported = ImportLabelsFromProjectBinary(dlg.FileName, loadCodes: true);
                 _currentProjectPath = dlg.FileName;
+                _objectLabelsAvailableFromProject = true;
+                SyncLabelsWindowObjectTabVisibility();
                 string projectName = Path.GetFileNameWithoutExtension(dlg.FileName);
-                Text = $"ps2dis# \u2014 {projectName}";
+                SetBaseTitleText($"ps2dis# — {projectName}");
                 RebuildLabelCache();
                 _disasmList.Invalidate();
 
@@ -1586,7 +1589,7 @@ namespace PS2Disassembler
                 UpdateHexScrollBar();
 
                 _miSave.Enabled = true;
-                Text = $"ps2dis# — {_fileName}";
+                SetBaseTitleText($"ps2dis# — {_fileName}");
                 int loadedLength = _fileData?.Length ?? data.Length;
                 bool loadedProjectImage = !loadedPis && _currentProjectPath != null && string.Equals(Path.GetFullPath(_currentProjectPath), Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase);
                 string infoSuffix = _elfInfo != null
@@ -2168,7 +2171,7 @@ namespace PS2Disassembler
             SyncMainViewMenuState();
 
             // Reset title and status
-            Text = "ps2dis#";
+            SetBaseTitleText("ps2dis#");
             _sbProgress.Text = "Detached.";
             _sbAddr.Text = "";
             _sbInfo.Text = "";
@@ -2510,23 +2513,70 @@ namespace PS2Disassembler
 
         private void UpdateMenuStatusLayout()
         {
-            if (_menuBar == null || _menuStatusLabel == null || _menuStatusSpring == null)
+            if (_menuStatusLabel == null || _menuBar == null)
                 return;
 
-            int reservedWidth = 420;
-            int usedWidth = 0;
-            foreach (ToolStripItem item in _menuBar.Items)
-            {
-                if (ReferenceEquals(item, _menuStatusSpring) || ReferenceEquals(item, _menuStatusLabel))
-                    continue;
-                usedWidth += item.Width + item.Margin.Horizontal;
-            }
+            // The status text is painted manually on the menu bar instead of
+            // being a ToolStrip item. That prevents ToolStrip overflow logic
+            // from hiding it at normal window widths.
+            _menuStatusLabel.Visible = false;
+            _menuStatusLabel.Width = Math.Min(420, Math.Max(80, Math.Max(0, _menuBar.Width - 360)));
+            _menuBar.Invalidate();
+        }
 
-            int available = Math.Max(0, _menuBar.DisplayRectangle.Width - usedWidth - _menuStatusLabel.Margin.Horizontal - 8);
-            int labelWidth = Math.Max(160, Math.Min(reservedWidth, available));
-            int springWidth = Math.Max(0, available - labelWidth);
-            _menuStatusSpring.Width = springWidth;
-            _menuStatusLabel.Width = labelWidth;
+        private void OnMenuBarPaintStatus(object? sender, PaintEventArgs e)
+        {
+            if (_menuStatusLabel == null || _menuBar == null || !_menuBar.Visible)
+                return;
+
+            string text = (_menuStatusLabel.Text ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(text))
+                return;
+
+            // Paint the status directly onto the right side of the menu bar.
+            // Do not depend on ToolStrip item overflow or leftover menu-item space,
+            // because compact windows can otherwise hide the status until resized wider.
+            int rightPadding = 6;
+            int right = Math.Max(0, _menuBar.ClientSize.Width - rightPadding);
+            int width = Math.Min(420, Math.Max(180, _menuBar.ClientSize.Width / 3));
+            int left = Math.Max(0, right - width);
+            if (right <= left)
+                return;
+
+            var rect = new Rectangle(left, 0, right - left, Math.Max(1, _menuBar.ClientSize.Height));
+            using (var backBrush = new SolidBrush(_menuBar.BackColor))
+                e.Graphics.FillRectangle(backBrush, rect);
+
+            Font font = _menuStatusLabel.Font ?? _menuBar.Font;
+            Color fore = _menuStatusLabel.ForeColor.IsEmpty ? _menuBar.ForeColor : _menuStatusLabel.ForeColor;
+            TextRenderer.DrawText(
+                e.Graphics,
+                text,
+                font,
+                rect,
+                fore,
+                TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+        }
+
+        private void SetBaseTitleText(string title)
+        {
+            _baseTitleText = string.IsNullOrWhiteSpace(title) ? "ps2dis#" : title.Trim();
+            UpdateTitleBarStatus();
+        }
+
+        private void UpdateTitleBarStatus()
+        {
+            if (IsDisposed) return;
+
+            string baseTitle = string.IsNullOrWhiteSpace(_baseTitleText) ? "ps2dis#" : _baseTitleText.Trim();
+            _titleBarStatusText = string.Empty;
+            Text = baseTitle;
+            try { _titleBarStatusOverlay?.Hide(); } catch { }
+        }
+
+        private void InvalidateTitleBarStatus()
+        {
+            try { _titleBarStatusOverlay?.Hide(); } catch { }
         }
 
         private void ApplyThemeToWindowChrome(Form target, bool forceFrameRefresh = false)
@@ -2601,6 +2651,7 @@ namespace PS2Disassembler
                 {
                     if (safeText == "Ready")
                         _activityStatusResetTimer.Stop();
+                    UpdateMenuStatusLayout();
                     return;
                 }
 
@@ -2875,7 +2926,7 @@ namespace PS2Disassembler
             UpdateHexScrollBar();
 
             _miSave.Enabled = true;
-            Text         = "ps2dis# \u2014 PCSX2 LIVE";
+            SetBaseTitleText("ps2dis# — PCSX2 LIVE");
             _sbInfo.Text = $"PCSX2 EE RAM    {eeMem.Length:N0} bytes    Base: 0x00000000";
             _sbSize.Text = $"{eeMem.Length / (1024.0 * 1024.0):F1} MB";
 
@@ -2886,6 +2937,11 @@ namespace PS2Disassembler
             QueueXrefAnalyzerAfterDisassembly(quiet: true, extendedCleanup: true);
             StartDisassembly();
             StartLiveMode();
+            if (_objectLabelDefinitions.Count > 0)
+                ApplyObjectLabelDefinitions(_objectLabelDefinitions, showDialogs: false);
+            else
+                EnsureObjectLabelLiveTimerState();
+            SyncLabelsWindowObjectTabVisibility();
         }
 
         // ══════════════════════════════════════════════════════════════════

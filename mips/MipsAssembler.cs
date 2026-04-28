@@ -49,6 +49,10 @@ namespace PS2Disassembler
                 {
                     // ── Special ───────────────────────────────────────────
                     "nop"    => 0u,
+                    "syscall"=> CodeFn(p, 0x0C),
+                    "break"  => CodeFn(p, 0x0D),
+                    "sync"   => CodeFn(p, 0x0F),
+                    "eret"   => (0x10u << 26) | (1u << 25) | 0x18u,
 
                     // ── J-type ────────────────────────────────────────────
                     "j"      => JType(0x02, p, pc),
@@ -73,14 +77,16 @@ namespace PS2Disassembler
                     "dsubu"  => RType(p, 0x2F),
 
                     // ── SPECIAL R-type: rd, rs, rt (mult has rd first on EE) ──
-                    "mult"   => RType(p, 0x18),
-                    "multu"  => RType(p, 0x19),
+                    "mult"   => MultDiv(p, 0x18),
+                    "multu"  => MultDiv(p, 0x19),
 
                     // ── SPECIAL R-type: rs, rt (div) ─────────────────────
-                    "div"    => RsRt(p, 0x1A),
-                    "divu"   => RsRt(p, 0x1B),
-                    "ddiv"   => RsRt(p, 0x1E),
-                    "ddivu"  => RsRt(p, 0x1F),
+                    "div"    => MultDiv(p, 0x1A),
+                    "divu"   => MultDiv(p, 0x1B),
+                    "dmult"  => MultDiv(p, 0x1C),
+                    "dmultu" => MultDiv(p, 0x1D),
+                    "ddiv"   => MultDiv(p, 0x1E),
+                    "ddivu"  => MultDiv(p, 0x1F),
 
                     // ── SPECIAL R-type: rd, rt, sa (immediate shift) ──────
                     "sll"    => ShiftImm(p, 0x00),
@@ -182,7 +188,9 @@ namespace PS2Disassembler
 
                     // ── COP0 moves: rt, c0reg ─────────────────────────────
                     "mfc0"   => (0x10u << 26) | (0u  << 21) | (Reg(p[0]) << 16) | (C0Reg(p[1]) << 11),
+                    "dmfc0"  => (0x10u << 26) | (1u  << 21) | (Reg(p[0]) << 16) | (C0Reg(p[1]) << 11),
                     "mtc0"   => (0x10u << 26) | (4u  << 21) | (Reg(p[0]) << 16) | (C0Reg(p[1]) << 11),
+                    "dmtc0"  => (0x10u << 26) | (5u  << 21) | (Reg(p[0]) << 16) | (C0Reg(p[1]) << 11),
 
                     // ── COP1 moves: rt, fs ────────────────────────────────
                     "mfc1"   => (0x11u << 26) | (0u  << 21) | (Reg(p[0]) << 16) | (FReg(p[1]) << 11),
@@ -202,7 +210,7 @@ namespace PS2Disassembler
                     "min.s"   => Cop1S3(0x29, p),
 
                     // ── COP1.S 2-operand dest+src: fd, fs ─────────────────
-                    "sqrt.s"  => Cop1S2d(0x04, p),
+                    "sqrt.s"  => Cop1SqrtS(p),
                     "abs.s"   => Cop1S2d(0x05, p),
                     "mov.s"   => Cop1S2d(0x06, p),
                     "neg.s"   => Cop1S2d(0x07, p),
@@ -224,9 +232,31 @@ namespace PS2Disassembler
                     // ── COP1.W: fd, fs ────────────────────────────────────
                     "cvt.s.w" => Cop1W2d(0x20, p),
 
+                    // ── COP1.D / conversions ──────────────────────────────
+                    "add.d"   => Cop1D3(0x00, p),
+                    "sub.d"   => Cop1D3(0x01, p),
+                    "mul.d"   => Cop1D3(0x02, p),
+                    "div.d"   => Cop1D3(0x03, p),
+                    "abs.d"   => Cop1D2d(0x05, p),
+                    "neg.d"   => Cop1D2d(0x07, p),
+                    "cvt.s.d" => Cop1D2d(0x20, p),
+                    "cvt.w.d" => Cop1D2d(0x24, p),
+                    "cvt.d.s" => Cop1S2dWithFmt(0x11, 0x21, p),
+                    "cvt.d.w" => Cop1S2dWithFmt(0x14, 0x21, p),
+                    "cvt.l.s" => Cop1S2dWithFmt(0x10, 0x25, p),
+                    "cvt.s.l" => Cop1S2dWithFmt(0x15, 0x20, p),
+                    "cvt.l.d" => Cop1S2dWithFmt(0x11, 0x25, p),
+                    "cvt.d.l" => Cop1S2dWithFmt(0x15, 0x21, p),
+
+                    // ── COP1 branches ─────────────────────────────────────
+                    "bc1f"    => Cop1Branch(false, p, pc),
+                    "bc1t"    => Cop1Branch(true, p, pc),
+
                     // ── COP1 loads/stores: ft, offset(base) ───────────────
                     "lwc1"    => MemOpFpu(0x31, p),
                     "swc1"    => MemOpFpu(0x39, p),
+                    "ldc1"    => MemOpFpu(0x35, p),
+                    "sdc1"    => MemOpFpu(0x3D, p),
 
                     // ── MMI main: rd, rs, rt ──────────────────────────────
                     "madd"    => MmiOps3(0x00, 0x00, p),
@@ -357,11 +387,36 @@ namespace PS2Disassembler
 
         // ── Encoders ──────────────────────────────────────────────────────
 
+        // SPECIAL: syscall/break/sync code field followed by function.
+        private static uint CodeFn(string[] p, uint fn)
+        {
+            uint code = p.Length > 0 && !string.IsNullOrWhiteSpace(p[0])
+                ? ((uint)ParseImm(p[0]) & 0x03FFFFFu)
+                : 0u;
+            return (code << 6) | fn;
+        }
+
         // R-type: rd, rs, rt  (fn only — opcode=0)
         private static uint RType(string[] p, uint fn)
         {
             uint rd = Reg(p[0]), rs = Reg(p[1]), rt = Reg(p[2]);
             return (rs << 21) | (rt << 16) | (rd << 11) | fn;
+        }
+
+        // R-type: rs, rt for standard mult/div, or rd, rs, rt for EE three-operand mult.
+        private static uint MultDiv(string[] p, uint fn)
+        {
+            if (p.Length == 2)
+            {
+                uint rs = Reg(p[0]), rt = Reg(p[1]);
+                return (rs << 21) | (rt << 16) | fn;
+            }
+            if (p.Length >= 3)
+            {
+                uint rd = Reg(p[0]), rs = Reg(p[1]), rt = Reg(p[2]);
+                return (rs << 21) | (rt << 16) | (rd << 11) | fn;
+            }
+            throw new FormatException();
         }
 
         // R-type: rs, rt  (div/divu)
@@ -468,6 +523,16 @@ namespace PS2Disassembler
             return (0x11u << 26) | (0x10u << 21) | (0u << 16) | (fs << 11) | (fd << 6) | fn;
         }
 
+        // Code Designer Lite preserves this EE/R5900 form for sqrt.s when fd == fs.
+        // Example: sqrt.s $f3, $f3 => 460300C4, not the generic 460018C4 form.
+        private static uint Cop1SqrtS(string[] p)
+        {
+            uint fd = FReg(p[0]), fs = FReg(p[1]);
+            if (fd == fs)
+                return (0x11u << 26) | (0x10u << 21) | (fd << 16) | (0u << 11) | (fd << 6) | 0x04u;
+            return (0x11u << 26) | (0x10u << 21) | (0u << 16) | (fs << 11) | (fd << 6) | 0x04u;
+        }
+
         // COP1.S 2-operand source: fs, ft (accumulator ops and comparisons)
         private static uint Cop1S2s(uint fn, string[] p)
         {
@@ -480,6 +545,30 @@ namespace PS2Disassembler
         {
             uint fd = FReg(p[0]), fs = FReg(p[1]);
             return (0x11u << 26) | (0x14u << 21) | (0u << 16) | (fs << 11) | (fd << 6) | fn;
+        }
+
+        // COP1.D 3-operand: fd, fs, ft
+        private static uint Cop1D3(uint fn, string[] p)
+        {
+            uint fd = FReg(p[0]), fs = FReg(p[1]), ft = FReg(p[2]);
+            return (0x11u << 26) | (0x11u << 21) | (ft << 16) | (fs << 11) | (fd << 6) | fn;
+        }
+
+        // COP1.D 2-operand dest+src: fd, fs
+        private static uint Cop1D2d(uint fn, string[] p)
+            => Cop1S2dWithFmt(0x11, fn, p);
+
+        private static uint Cop1S2dWithFmt(uint fmt, uint fn, string[] p)
+        {
+            uint fd = FReg(p[0]), fs = FReg(p[1]);
+            return (0x11u << 26) | (fmt << 21) | (0u << 16) | (fs << 11) | (fd << 6) | fn;
+        }
+
+        private static uint Cop1Branch(bool taken, string[] p, uint pc)
+        {
+            uint target = ParseAddr(p[0]);
+            ushort offset = (ushort)BranchOffset(target, pc);
+            return (0x11u << 26) | (0x08u << 21) | ((taken ? 1u : 0u) << 16) | offset;
         }
 
         // MMI 3-operand: rd, rs, rt
@@ -522,16 +611,20 @@ namespace PS2Disassembler
         private static uint Reg(string s)
         {
             s = s.Trim().ToLowerInvariant();
+            if (s.StartsWith('$')) s = s[1..];
+
             int idx = Array.IndexOf(GprAbi, s);
             if (idx >= 0) return (uint)idx;
-            if (s.StartsWith('$') && uint.TryParse(s[1..], out uint n) && n < 32) return n;
+            if (uint.TryParse(s, out uint n) && n < 32) return n;
             throw new FormatException($"Unknown register: {s}");
         }
 
         private static uint FReg(string s)
         {
             s = s.Trim().ToLowerInvariant();
+            if (s.StartsWith('$')) s = s[1..];
             if (s.StartsWith('f') && uint.TryParse(s[1..], out uint n) && n < 32) return n;
+            if (uint.TryParse(s, out uint m) && m < 32) return m;
             throw new FormatException($"Unknown FPU register: {s}");
         }
 

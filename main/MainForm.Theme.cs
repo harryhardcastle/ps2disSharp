@@ -196,6 +196,13 @@ namespace PS2Disassembler
                 _menuBar.ForeColor = _headerFore;
                 _menuBar.Renderer = new ThemedToolStripRenderer(dark, _headerFore);
                 ApplyThemeToToolStripItems(_menuBar.Items);
+                if (_menuStatusLabel != null && !_menuPauseStatusActive)
+                {
+                    _menuStatusLabel.ForeColor = _headerFore;
+                    _menuStatusLabel.Font = _menuBar.Font;
+                    _menuPauseStatusSavedColor = _headerFore;
+                    _menuPauseStatusSavedFont = _menuBar.Font;
+                }
                 if (_menuPauseStatusActive)
                 {
                     _menuPauseStatusSavedColor = _headerFore;
@@ -278,7 +285,17 @@ namespace PS2Disassembler
 
             // Also theme the Code Manager inline panel if it's been populated
             var cmPanel = FindCodeManagerPanel();
-            if (cmPanel != null) ApplyThemeToControlTree(cmPanel);
+            if (cmPanel != null)
+            {
+                ApplyThemeToControlTree(cmPanel);
+                ApplyScrollbarTheme(cmPanel, dark);
+            }
+            _codeToolsDlg?.ApplyEditorScrollbarTheme(dark);
+            if (_codeDesignerWorkspace != null && !_codeDesignerWorkspace.IsDisposed)
+            {
+                _codeDesignerWorkspace.ApplyTheme(dark);
+                ApplyScrollbarTheme(_codeDesignerWorkspace, dark);
+            }
 
             RefreshTitleBarTheme(forceFrameRefresh);
 
@@ -383,6 +400,20 @@ namespace PS2Disassembler
             return false;
         }
 
+        private Font GetStandardTextBoxFont()
+        {
+            return _txtReadBreakpoint?.Font ?? Font ?? new Font("Tahoma", 8.25f);
+        }
+
+        private static Color BrightenColorByPercent(Color color, float factor)
+        {
+            factor = Math.Max(0f, factor);
+            return Color.FromArgb(color.A,
+                Math.Min(255, (int)Math.Round(color.R * factor)),
+                Math.Min(255, (int)Math.Round(color.G * factor)),
+                Math.Min(255, (int)Math.Round(color.B * factor)));
+        }
+
         private void ApplyThemeToControlTree(Control root)
         {
             if (root is MenuStrip or StatusStrip)
@@ -439,6 +470,7 @@ namespace PS2Disassembler
                     }
                     break;
                 case TextBox tb:
+                    tb.Font = GetStandardTextBoxFont();
                     tb.BackColor = _themeWindowBack;
                     tb.ForeColor = _themeWindowFore;
                     tb.BorderStyle = BorderStyle.FixedSingle;
@@ -451,20 +483,22 @@ namespace PS2Disassembler
                 case Button btn:
                     if (Equals(btn.Tag, FlatTabHost.TabButtonTag))
                         break;
-                    btn.BackColor = _headerBack;
+                    Color buttonBack = BrightenColorByPercent(_headerBack, 1.20f);
+                    Color buttonHover = BrightenColorByPercent(Color.FromArgb(
+                        Math.Min(255, _headerBack.R + 18),
+                        Math.Min(255, _headerBack.G + 18),
+                        Math.Min(255, _headerBack.B + 30)), 1.20f);
+                    btn.BackColor = buttonBack;
                     btn.ForeColor = _headerFore;
                     btn.UseVisualStyleBackColor = false;
                     btn.FlatStyle = FlatStyle.Flat;
                     btn.FlatAppearance.BorderColor = _headerBorder;
                     btn.FlatAppearance.BorderSize = 1;
-                    btn.FlatAppearance.MouseOverBackColor = Color.FromArgb(
-                        Math.Min(255, _headerBack.R + 18),
-                        Math.Min(255, _headerBack.G + 18),
-                        Math.Min(255, _headerBack.B + 30));
+                    btn.FlatAppearance.MouseOverBackColor = buttonHover;
                     btn.FlatAppearance.MouseDownBackColor = Color.FromArgb(
-                        Math.Max(0, _headerBack.R - 10),
-                        Math.Max(0, _headerBack.G - 10),
-                        Math.Min(255, _headerBack.B + 40));
+                        Math.Max(0, buttonBack.R - 10),
+                        Math.Max(0, buttonBack.G - 10),
+                        Math.Min(255, buttonBack.B + 40));
                     // Attach custom disabled-text painting for dark theme so text stays legible
                     AttachDisabledButtonPainter(btn, _currentTheme == AppTheme.Dark);
                     break;
@@ -1579,10 +1613,221 @@ namespace PS2Disassembler
                 m.Result = (IntPtr)MA_ACTIVATE;
                 return;
             }
+
             base.WndProc(ref m);
+
+            // Status text is displayed in the right side of the menu bar.
+            // Do not draw custom status text over the native title bar.
+
+        }
+
+        private void ScheduleTitleBarStatusDraw(bool immediate = false)
+        {
+            if (IsDisposed || !IsHandleCreated)
+                return;
+
+            if (immediate)
+            {
+                DrawTitleBarStatusText();
+                UpdateTitleBarStatusOverlay();
+            }
+
+            try
+            {
+                if (_titleBarStatusDrawTimer != null)
+                {
+                    _titleBarStatusDrawTimer.Stop();
+                    _titleBarStatusDrawTimer.Start();
+                }
+                else if (!immediate)
+                {
+                    DrawTitleBarStatusText();
+                    UpdateTitleBarStatusOverlay();
+                }
+            }
+            catch { }
+        }
+
+        private void UpdateTitleBarStatusOverlay()
+        {
+            if (IsDisposed || !IsHandleCreated || WindowState == FormWindowState.Minimized)
+            {
+                try { _titleBarStatusOverlay?.Hide(); } catch { }
+                return;
+            }
+
+            string status = (_titleBarStatusText ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(status))
+            {
+                try { _titleBarStatusOverlay?.Hide(); } catch { }
+                return;
+            }
+
+            try
+            {
+                if (_titleBarStatusOverlay == null || _titleBarStatusOverlay.IsDisposed)
+                    _titleBarStatusOverlay = new TitleBarStatusOverlay();
+
+                int buttonWidth = Math.Max(36, SystemInformation.CaptionButtonSize.Width);
+                int captionHeight = Math.Max(24, SystemInformation.CaptionHeight);
+                int overlayWidth = Math.Min(440, Math.Max(160, Width / 2));
+                if (!NativeMethods.GetWindowRect(Handle, out var wr))
+                    return;
+
+                int x = wr.Right - (buttonWidth * 3) - overlayWidth - 10;
+                int y = wr.Top + 1;
+                _titleBarStatusOverlay.SetContent(status, _themeTitleBarBack, _menuPauseStatusActive ? ColJump : _themeTitleBarText, Font, _menuPauseStatusActive);
+                _titleBarStatusOverlay.Bounds = new Rectangle(x, y, overlayWidth, captionHeight);
+                if (!_titleBarStatusOverlay.Visible)
+                    _titleBarStatusOverlay.Show(this);
+                _titleBarStatusOverlay.Invalidate();
+            }
+            catch { }
+        }
+
+        private void DrawTitleBarStatusText()
+        {
+            if (IsDisposed || !IsHandleCreated || WindowState == FormWindowState.Minimized)
+                return;
+
+            string status = (_titleBarStatusText ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(status))
+                return;
+
+            IntPtr hdc = IntPtr.Zero;
+            try
+            {
+                hdc = NativeMethods.GetWindowDC(Handle);
+                if (hdc == IntPtr.Zero) return;
+
+                using Graphics g = Graphics.FromHdc(hdc);
+                int buttonWidth = Math.Max(36, SystemInformation.CaptionButtonSize.Width);
+                int captionHeight = Math.Max(24, SystemInformation.CaptionHeight);
+                int right = Math.Max(120, Width - (buttonWidth * 3) - 10);
+                int left = Math.Max(96, right - Math.Min(440, Math.Max(160, Width / 2)));
+                var rect = new Rectangle(left, 0, Math.Max(10, right - left), captionHeight + 2);
+
+                using var backBrush = new SolidBrush(_themeTitleBarBack);
+                g.FillRectangle(backBrush, rect);
+                using var font = _menuPauseStatusActive
+                    ? new Font(Font, FontStyle.Bold)
+                    : new Font(Font.FontFamily, Font.Size, FontStyle.Regular);
+                TextRenderer.DrawText(
+                    g,
+                    status,
+                    font,
+                    rect,
+                    _menuPauseStatusActive ? ColJump : _themeTitleBarText,
+                    TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+            }
+            catch { }
+            finally
+            {
+                if (hdc != IntPtr.Zero)
+                    NativeMethods.ReleaseDC(Handle, hdc);
+            }
+        }
+
+        private sealed class TitleBarStatusOverlay : Form
+        {
+            private string _text = string.Empty;
+            private Color _back = SystemColors.ControlDarkDark;
+            private Color _fore = Color.White;
+            private Font? _baseFont;
+            private bool _bold;
+
+            protected override bool ShowWithoutActivation => true;
+
+            protected override CreateParams CreateParams
+            {
+                get
+                {
+                    const int WS_EX_TOOLWINDOW = 0x00000080;
+                    const int WS_EX_NOACTIVATE = 0x08000000;
+                    const int WS_EX_TRANSPARENT = 0x00000020;
+                    var cp = base.CreateParams;
+                    cp.ExStyle |= WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT;
+                    return cp;
+                }
+            }
+
+            public TitleBarStatusOverlay()
+            {
+                FormBorderStyle = FormBorderStyle.None;
+                ShowInTaskbar = false;
+                StartPosition = FormStartPosition.Manual;
+                DoubleBuffered = true;
+            }
+
+            public void SetContent(string text, Color back, Color fore, Font baseFont, bool bold)
+            {
+                _text = text ?? string.Empty;
+                _back = back;
+                _fore = fore;
+                _baseFont = baseFont;
+                _bold = bold;
+                BackColor = back;
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                base.OnPaint(e);
+                e.Graphics.Clear(_back);
+                using var font = _baseFont == null
+                    ? new Font(SystemFonts.CaptionFont, _bold ? FontStyle.Bold : FontStyle.Regular)
+                    : new Font(_baseFont, _bold ? FontStyle.Bold : FontStyle.Regular);
+                TextRenderer.DrawText(
+                    e.Graphics,
+                    _text,
+                    font,
+                    ClientRectangle,
+                    _fore,
+                    TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+            }
+
+            protected override void WndProc(ref Message m)
+            {
+                const int WM_NCHITTEST = 0x0084;
+                const int HTTRANSPARENT = -1;
+                if (m.Msg == WM_NCHITTEST)
+                {
+                    m.Result = new IntPtr(HTTRANSPARENT);
+                    return;
+                }
+                base.WndProc(ref m);
+            }
         }
 
         // ── Font / Options ──────────────────────────────────────────────
+
+        private int GetDisasmRowSpacingPaddingPixels()
+        {
+            string rowSpacing = AppSettings.NormalizeRowSpacing(_appSettings?.RowSpacing);
+            return rowSpacing switch
+            {
+                "Compact" => 0,
+                "Large" => 2,
+                _ => 1,
+            };
+        }
+
+        private int CalculateDisasmRowHeight()
+            => Math.Max(1, _mono.Height + (GetDisasmRowSpacingPaddingPixels() * 2));
+
+        private void ApplyDisasmRowSpacingSetting()
+        {
+            _disasmRowHeight = CalculateDisasmRowHeight();
+            ApplyDisasmViewMetrics();
+            ApplyHexViewMetrics();
+            if (_asciiBytesBar != null && !_asciiBytesBar.IsDisposed)
+            {
+                _asciiBytesBar.Height = CurrentDisasmRowHeight;
+                _asciiBytesBar.Invalidate();
+            }
+            AdjustHexSplitter();
+            _disasmList?.Invalidate();
+            _hexList?.Invalidate();
+        }
 
         private void ApplyFontFromSettings(string fontFamily, float fontSize)
         {
@@ -1605,7 +1850,7 @@ namespace PS2Disassembler
 
             var oldFont = _mono;
             _mono = newFont;
-            _disasmRowHeight = Math.Max(16, _mono.Height + 2);
+            _disasmRowHeight = CalculateDisasmRowHeight();
 
             if (_disasmList != null && !_disasmList.IsDisposed)
             {
@@ -1627,7 +1872,7 @@ namespace PS2Disassembler
 
             // Refresh any inline edit that may exist
             if (_inlineEdit != null && !_inlineEdit.IsDisposed)
-                _inlineEdit.Font = _mono;
+                _inlineEdit.Font = GetStandardTextBoxFont();
 
             _disasmList?.Invalidate();
             _hexList?.Invalidate();
@@ -1652,6 +1897,7 @@ namespace PS2Disassembler
                 bool fontChanged = _appSettings.FontFamily != dlg.SelectedFontFamily
                                 || Math.Abs(_appSettings.FontSize - dlg.SelectedFontSize) > 0.01f;
                 bool themeChanged = _appSettings.Theme != dlg.SelectedTheme;
+                bool rowSpacingChanged = !string.Equals(AppSettings.NormalizeRowSpacing(_appSettings.RowSpacing), dlg.SelectedRowSpacing, StringComparison.OrdinalIgnoreCase);
                 bool refreshRateChanged = _appSettings.RefreshRate != dlg.SelectedRefreshRate;
                 bool constantWriteRateChanged = _appSettings.ConstantWriteRate != dlg.SelectedConstantWriteRate;
                 bool memoryViewVisibilityChanged = _appSettings.ShowMemoryView != dlg.SelectedShowMemoryView;
@@ -1663,6 +1909,7 @@ namespace PS2Disassembler
                 _appSettings.FontFamily = dlg.SelectedFontFamily;
                 _appSettings.FontSize = dlg.SelectedFontSize;
                 _appSettings.Theme = dlg.SelectedTheme;
+                _appSettings.RowSpacing = dlg.SelectedRowSpacing;
                 _appSettings.RefreshRate = dlg.SelectedRefreshRate;
                 _appSettings.ConstantWriteRate = dlg.SelectedConstantWriteRate;
                 _appSettings.ShowMemoryView = dlg.SelectedShowMemoryView;
@@ -1680,6 +1927,8 @@ namespace PS2Disassembler
 
                 if (fontChanged)
                     ApplyFontFromSettings(_appSettings.FontFamily, _appSettings.FontSize);
+                else if (rowSpacingChanged)
+                    ApplyDisasmRowSpacingSetting();
 
                 if (refreshRateChanged)
                     UpdateLiveRefreshTimerInterval();
@@ -1739,6 +1988,8 @@ namespace PS2Disassembler
             if (disposing)
             {
                 try { _debugServer.Dispose(); } catch { }
+                try { _titleBarStatusDrawTimer?.Dispose(); } catch { }
+                try { _titleBarStatusOverlay?.Dispose(); } catch { }
                 _mono.Dispose();
                 _disCts?.Dispose();
                 _xrefCts?.Dispose();

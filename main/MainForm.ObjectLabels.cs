@@ -164,7 +164,12 @@ namespace PS2Disassembler
     {
         private List<ObjectLabelDefinition> _objectLabelDefinitions = new List<ObjectLabelDefinition>();
         private Dictionary<uint, string> _objectTempLabels = new Dictionary<uint, string>();
+        private readonly Dictionary<uint, uint?> _objectLabelPointerSnapshot = new Dictionary<uint, uint?>();
+        private System.Windows.Forms.Timer? _objectLabelLiveTimer;
+        private bool _objectLabelsAvailableFromProject;
         private int _labelsWindowSelectedTabIndex;
+
+        private bool ShouldShowObjectLabelsTab() => IsLiveAttached() || _objectLabelsAvailableFromProject;
 
         private List<ObjectLabelDefinition> CloneObjectLabelDefinitions(IEnumerable<ObjectLabelDefinition> source)
             => source.Select(x => x.Clone()).ToList();
@@ -172,8 +177,13 @@ namespace PS2Disassembler
         private void ClearObjectLabelState(bool clearDefinitions)
         {
             _objectTempLabels = new Dictionary<uint, string>();
+            _objectLabelPointerSnapshot.Clear();
+            _objectLabelLiveTimer?.Stop();
             if (clearDefinitions)
+            {
                 _objectLabelDefinitions = new List<ObjectLabelDefinition>();
+                _objectLabelsAvailableFromProject = false;
+            }
         }
 
         private void ClearGeneratedObjectTempLabels()
@@ -183,6 +193,108 @@ namespace PS2Disassembler
 
             _objectTempLabels = new Dictionary<uint, string>();
             RefreshObjectLabelDisplays();
+        }
+
+        private static bool IsValidObjectLabelPointer(uint staticAddress, uint objectAddress)
+        {
+            return objectAddress != 0
+                && objectAddress != staticAddress
+                && ShouldDereferenceAnnotationAddress(objectAddress);
+        }
+
+        private bool TryReadTrackedObjectPointer(ObjectLabelDefinition definition, out uint? objectAddress)
+        {
+            objectAddress = null;
+            if (definition == null)
+                return false;
+
+            if (!TryReadWordAt(definition.StaticAddress, out uint value))
+                return false;
+
+            objectAddress = value;
+            return true;
+        }
+
+        private bool TryGetActiveObjectRuntimeAddress(ObjectLabelDefinition definition, out uint objectAddress)
+        {
+            objectAddress = 0;
+            if (!TryReadTrackedObjectPointer(definition, out uint? rawPointer) || !rawPointer.HasValue)
+                return false;
+
+            uint value = rawPointer.Value;
+            if (!IsValidObjectLabelPointer(definition.StaticAddress, value))
+                return false;
+
+            objectAddress = value;
+            return true;
+        }
+
+        private void RefreshObjectLabelPointerSnapshot(IEnumerable<ObjectLabelDefinition> definitions)
+        {
+            _objectLabelPointerSnapshot.Clear();
+            foreach (ObjectLabelDefinition definition in definitions)
+            {
+                if (TryReadTrackedObjectPointer(definition, out uint? objectAddress))
+                    _objectLabelPointerSnapshot[definition.StaticAddress] = objectAddress;
+                else
+                    _objectLabelPointerSnapshot[definition.StaticAddress] = null;
+            }
+        }
+
+        private void EnsureObjectLabelLiveTimerState()
+        {
+            bool shouldRun = IsLiveAttached() && _objectLabelDefinitions.Count > 0;
+            if (!shouldRun)
+            {
+                _objectLabelLiveTimer?.Stop();
+                _objectLabelPointerSnapshot.Clear();
+                return;
+            }
+
+            if (_objectLabelLiveTimer == null)
+            {
+                _objectLabelLiveTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+                _objectLabelLiveTimer.Tick += (_, _) => OnObjectLabelLiveTimerTick();
+            }
+
+            if (_objectLabelPointerSnapshot.Count == 0)
+                RefreshObjectLabelPointerSnapshot(_objectLabelDefinitions);
+
+            if (!_objectLabelLiveTimer.Enabled)
+                _objectLabelLiveTimer.Start();
+        }
+
+        private void OnObjectLabelLiveTimerTick()
+        {
+            if (!IsLiveAttached() || _objectLabelDefinitions.Count == 0)
+            {
+                EnsureObjectLabelLiveTimerState();
+                return;
+            }
+
+            bool changed = false;
+            var activeStaticAddresses = new HashSet<uint>(_objectLabelDefinitions.Select(x => x.StaticAddress));
+            foreach (uint staleAddress in _objectLabelPointerSnapshot.Keys.Where(x => !activeStaticAddresses.Contains(x)).ToList())
+            {
+                _objectLabelPointerSnapshot.Remove(staleAddress);
+                changed = true;
+            }
+
+            foreach (ObjectLabelDefinition definition in _objectLabelDefinitions)
+            {
+                uint? currentPointer = null;
+                if (TryReadTrackedObjectPointer(definition, out uint? objectAddress))
+                    currentPointer = objectAddress;
+
+                if (!_objectLabelPointerSnapshot.TryGetValue(definition.StaticAddress, out uint? previousPointer) || previousPointer != currentPointer)
+                {
+                    _objectLabelPointerSnapshot[definition.StaticAddress] = currentPointer;
+                    changed = true;
+                }
+            }
+
+            if (changed)
+                ApplyObjectLabelDefinitions(_objectLabelDefinitions, showDialogs: false);
         }
 
         private void RefreshObjectLabelDisplays()
@@ -201,8 +313,15 @@ namespace PS2Disassembler
             _asciiBytesBar?.Invalidate();
         }
 
+        private void ConvertObjectDefinitionsToWordData(IEnumerable<ObjectLabelDefinition> definitions)
+        {
+            foreach (ObjectLabelDefinition definition in definitions)
+                ConvertAddressToWordData(definition.StaticAddress);
+        }
+
         private ObjectLabelUpdateResult ApplyObjectLabelDefinitions(IReadOnlyList<ObjectLabelDefinition> definitions, bool showDialogs)
         {
+            ConvertObjectDefinitionsToWordData(definitions);
             ClearGeneratedObjectTempLabels();
 
             var result = new ObjectLabelUpdateResult
@@ -232,13 +351,14 @@ namespace PS2Disassembler
 
             foreach (var definition in definitions)
             {
-                if (!TryReadWordAt(definition.StaticAddress, out uint objectAddress))
+                if (!TryReadTrackedObjectPointer(definition, out uint? objectAddressValue) || !objectAddressValue.HasValue)
                 {
                     result.Errors.Add($"{definition.StaticAddress:X8}:{definition.Label} - could not read the object pointer.");
                     continue;
                 }
 
-                if (!ShouldDereferenceAnnotationAddress(objectAddress))
+                uint objectAddress = objectAddressValue.Value;
+                if (!IsValidObjectLabelPointer(definition.StaticAddress, objectAddress))
                 {
                     result.Errors.Add($"{definition.StaticAddress:X8}:{definition.Label} - pointer {objectAddress:X8} is not a valid populated address.");
                     continue;
@@ -284,6 +404,8 @@ namespace PS2Disassembler
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
 
+            RefreshObjectLabelPointerSnapshot(definitions);
+            EnsureObjectLabelLiveTimerState();
             return result;
         }
 
@@ -296,6 +418,149 @@ namespace PS2Disassembler
             count++;
         }
 
+        internal sealed class AddObjectLabelCandidate
+        {
+            public ObjectLabelDefinition Definition { get; init; } = new ObjectLabelDefinition();
+            public uint ObjectAddress { get; init; }
+            public uint Offset { get; init; }
+            public override string ToString()
+                => $"{Definition.Label} ({Definition.StaticAddress:X8} -> {ObjectAddress:X8})";
+        }
+
+        private List<AddObjectLabelCandidate> GetAddObjectLabelCandidates(uint selectedAddress)
+        {
+            var candidates = new List<AddObjectLabelCandidate>();
+            foreach (ObjectLabelDefinition definition in _objectLabelDefinitions)
+            {
+                if (!TryGetActiveObjectRuntimeAddress(definition, out uint objectAddress))
+                    continue;
+                if (selectedAddress < objectAddress)
+                    continue;
+
+                candidates.Add(new AddObjectLabelCandidate
+                {
+                    Definition = definition,
+                    ObjectAddress = objectAddress,
+                    Offset = selectedAddress - objectAddress,
+                });
+            }
+
+            return candidates
+                .OrderBy(x => x.Offset)
+                .ThenBy(x => x.Definition.Label, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(x => x.Definition.StaticAddress)
+                .ToList();
+        }
+
+        private void DefineObjectFromSelectedRow()
+        {
+            if (!IsLiveAttached())
+                return;
+
+            if (_selRow < 0 || _selRow >= _rows.Count)
+                return;
+
+            uint selectedAddress = _rows[_selRow].Address;
+            using var dlg = new DefineObjectDialog(selectedAddress);
+            dlg.ApplyThemeColors(_themeFormBack, _themeFormFore, _themeWindowBack, _themeWindowFore, _currentTheme == AppTheme.Dark);
+            dlg.Load += (_, _) => ApplyThemeToWindowChrome(dlg, forceFrameRefresh: true);
+            if (dlg.ShowDialog(this) != DialogResult.OK)
+                return;
+
+            string objectName = dlg.ObjectName.Trim();
+            if (string.IsNullOrWhiteSpace(objectName))
+                return;
+
+            int existingIndex = _objectLabelDefinitions.FindIndex(x => x.StaticAddress == selectedAddress);
+            ObjectLabelDefinition definition;
+            if (existingIndex >= 0)
+            {
+                definition = _objectLabelDefinitions[existingIndex];
+                definition.Label = objectName;
+                definition.RawText = ObjectLabelDefinitionParser.BuildCompactDefinitionText(definition);
+                _objectLabelDefinitions[existingIndex] = definition;
+            }
+            else
+            {
+                definition = new ObjectLabelDefinition
+                {
+                    StaticAddress = selectedAddress,
+                    Label = objectName,
+                };
+                definition.RawText = ObjectLabelDefinitionParser.BuildCompactDefinitionText(definition);
+                _objectLabelDefinitions.Add(definition);
+            }
+
+            _objectLabelDefinitions = _objectLabelDefinitions
+                .OrderBy(x => x.StaticAddress)
+                .ThenBy(x => x.Label, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            ConvertAddressToWordData(selectedAddress);
+
+            if (_labelsWindow != null && !_labelsWindow.IsDisposed)
+                _labelsWindow.SetData(_cachedLabels, _objectLabelDefinitions, ShouldShowObjectLabelsTab());
+
+            ApplyObjectLabelDefinitions(_objectLabelDefinitions, showDialogs: false);
+            SetActivityStatus($"Defined object '{objectName}' at {selectedAddress:X8}.");
+        }
+
+        private void AddObjectLabelFromSelectedRow()
+        {
+            if (!IsLiveAttached())
+                return;
+
+            if (_selRow < 0 || _selRow >= _rows.Count)
+                return;
+
+            uint selectedAddress = _rows[_selRow].Address;
+            List<AddObjectLabelCandidate> candidates = GetAddObjectLabelCandidates(selectedAddress);
+            using var dlg = new AddObjectFieldLabelDialog(selectedAddress, candidates);
+            dlg.ApplyThemeColors(_themeFormBack, _themeFormFore, _themeWindowBack, _themeWindowFore, _currentTheme == AppTheme.Dark);
+            dlg.Load += (_, _) => ApplyThemeToWindowChrome(dlg, forceFrameRefresh: true);
+            if (dlg.ShowDialog(this) != DialogResult.OK || dlg.SelectedStaticAddress == null)
+                return;
+
+            int definitionIndex = _objectLabelDefinitions.FindIndex(x => x.StaticAddress == dlg.SelectedStaticAddress.Value);
+            if (definitionIndex < 0)
+                return;
+
+            ObjectLabelDefinition definition = _objectLabelDefinitions[definitionIndex];
+            string newLabel = dlg.EnteredLabel.Trim();
+            uint offset = dlg.SelectedOffset;
+            ObjectLabelField? existingField = definition.Fields.FirstOrDefault(x => x.Offset == offset);
+            bool removed = false;
+            if (string.IsNullOrWhiteSpace(newLabel))
+            {
+                if (existingField != null)
+                {
+                    definition.Fields.Remove(existingField);
+                    removed = true;
+                }
+            }
+            else if (existingField != null)
+            {
+                existingField.Label = newLabel;
+            }
+            else
+            {
+                definition.Fields.Add(new ObjectLabelField { Offset = offset, Label = newLabel });
+            }
+
+            definition.RawText = ObjectLabelDefinitionParser.BuildCompactDefinitionText(definition);
+            _objectLabelDefinitions[definitionIndex] = definition;
+            if (_labelsWindow != null && !_labelsWindow.IsDisposed)
+                _labelsWindow.SetData(_cachedLabels, _objectLabelDefinitions, ShouldShowObjectLabelsTab());
+
+            ApplyObjectLabelDefinitions(_objectLabelDefinitions, showDialogs: false);
+            if (removed)
+                SetActivityStatus($"Removed object label from {definition.Label} +{offset:X}.");
+            else if (!string.IsNullOrWhiteSpace(newLabel))
+                SetActivityStatus($"Updated object label '{newLabel}' at {definition.Label} +{offset:X}.");
+            else
+                SetActivityStatus($"No object label exists at {definition.Label} +{offset:X}.");
+        }
+
         private void ShowLabelBrowser()
         {
             if (_cachedLabels.Count == 0)
@@ -303,7 +568,7 @@ namespace PS2Disassembler
 
             if (_labelsWindow == null || _labelsWindow.IsDisposed)
             {
-                _labelsWindow = new LabelsWindowDialog(_cachedLabels, _objectLabelDefinitions, IsLiveAttached());
+                _labelsWindow = new LabelsWindowDialog(_cachedLabels, _objectLabelDefinitions, ShouldShowObjectLabelsTab());
                 _labelsWindow.InitialFilter = _labelBrowserFilter;
                 _labelsWindow.InitialLabelsOnly = _labelBrowserLabelsOnly;
                 _labelsWindow.InitialSelectedAddress = _labelBrowserSelectedAddress;
@@ -311,7 +576,7 @@ namespace PS2Disassembler
                 _labelsWindow.UpdateObjectsCallback = defs =>
                 {
                     _objectLabelDefinitions = CloneObjectLabelDefinitions(defs);
-                    return ApplyObjectLabelDefinitions(defs, showDialogs: true);
+                    return ApplyObjectLabelDefinitions(defs, showDialogs: false);
                 };
                 _labelsWindow.NavigateToAddressCallback = NavigateToAddressFromLabelsWindow;
                 _labelsWindow.ApplyThemeColors(_themeFormBack, _themeFormFore, _themeWindowBack, _themeWindowFore, _currentTheme == AppTheme.Dark);
@@ -328,14 +593,15 @@ namespace PS2Disassembler
                 _labelsWindow.ApplyInitialState();
                 CenterLabelsWindow();
                 _labelsWindow.Show(this);
+                EnsureObjectLabelLiveTimerState();
             }
             else
             {
-                _labelsWindow.SetData(_cachedLabels, _objectLabelDefinitions, IsLiveAttached());
+                _labelsWindow.SetData(_cachedLabels, _objectLabelDefinitions, ShouldShowObjectLabelsTab());
                 _labelsWindow.UpdateObjectsCallback = defs =>
                 {
                     _objectLabelDefinitions = CloneObjectLabelDefinitions(defs);
-                    return ApplyObjectLabelDefinitions(defs, showDialogs: true);
+                    return ApplyObjectLabelDefinitions(defs, showDialogs: false);
                 };
                 _labelsWindow.NavigateToAddressCallback = NavigateToAddressFromLabelsWindow;
                 _labelsWindow.ApplyThemeColors(_themeFormBack, _themeFormFore, _themeWindowBack, _themeWindowFore, _currentTheme == AppTheme.Dark);
@@ -346,6 +612,7 @@ namespace PS2Disassembler
                 }
             }
 
+            EnsureObjectLabelLiveTimerState();
             _labelsWindow?.BringToFront();
             _labelsWindow?.Activate();
         }
@@ -393,8 +660,8 @@ namespace PS2Disassembler
             if (_labelsWindow == null || _labelsWindow.IsDisposed)
                 return;
 
-            _labelsWindow.SetShowObjectLabels(IsLiveAttached());
-            _labelsWindow.SetData(_cachedLabels, _objectLabelDefinitions, IsLiveAttached());
+            _labelsWindow.SetShowObjectLabels(ShouldShowObjectLabelsTab());
+            _labelsWindow.SetData(_cachedLabels, _objectLabelDefinitions, ShouldShowObjectLabelsTab());
             _labelsWindow.ApplyThemeColors(_themeFormBack, _themeFormFore, _themeWindowBack, _themeWindowFore, _currentTheme == AppTheme.Dark);
         }
     }
@@ -404,13 +671,18 @@ namespace PS2Disassembler
         private readonly RichTextBox _tbDefinition;
         private readonly Button _btnAccept;
         private readonly Panel _footer;
+        private readonly string _placeholderText;
+        private bool _showingPlaceholder;
         private bool _dark;
         private Color _titleBarBack = SystemColors.ActiveCaption;
         private Color _titleBarFore = SystemColors.ActiveCaptionText;
+        private Color _definitionFore = SystemColors.ControlText;
+        private Color _placeholderFore = SystemColors.GrayText;
         public ObjectLabelDefinition? ObjectDefinition { get; private set; }
 
-        public AddObjectDefinitionDialog(string title = "Add Object Definition", string actionText = "Add Object", string initialText = "")
+        public AddObjectDefinitionDialog(string title = "Add Object Definition", string actionText = "Add Object", string initialText = "", string placeholderText = "")
         {
+            _placeholderText = placeholderText ?? string.Empty;
             Text = title;
             Size = new Size(520, 420);
             MinimumSize = new Size(420, 300);
@@ -430,6 +702,10 @@ namespace PS2Disassembler
             };
             _tbDefinition.HandleCreated += (_, _) => NativeMethods.SetRichTextBoxPadding(_tbDefinition, 5);
             _tbDefinition.Resize += (_, _) => NativeMethods.SetRichTextBoxPadding(_tbDefinition, 5);
+            _tbDefinition.KeyDown += OnDefinitionKeyDown;
+            _tbDefinition.KeyPress += OnDefinitionKeyPress;
+            if (string.IsNullOrWhiteSpace(initialText) && !string.IsNullOrWhiteSpace(_placeholderText))
+                ShowPlaceholder();
 
             _footer = new Panel
             {
@@ -458,7 +734,7 @@ namespace PS2Disassembler
         {
             try
             {
-                ObjectDefinition = ObjectLabelDefinitionParser.Parse(_tbDefinition.Text);
+                ObjectDefinition = ObjectLabelDefinitionParser.Parse(GetDefinitionText());
                 DialogResult = DialogResult.OK;
                 Close();
             }
@@ -467,6 +743,42 @@ namespace PS2Disassembler
                 MessageBox.Show(this, ex.Message, Text,
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
+        }
+
+        private string GetDefinitionText()
+            => _showingPlaceholder ? string.Empty : _tbDefinition.Text;
+
+        private void OnDefinitionKeyPress(object? sender, KeyPressEventArgs e)
+        {
+            if (_showingPlaceholder && !char.IsControl(e.KeyChar))
+                ClearPlaceholder();
+        }
+
+        private void OnDefinitionKeyDown(object? sender, KeyEventArgs e)
+        {
+            if (!_showingPlaceholder)
+                return;
+
+            if ((e.Control && e.KeyCode == Keys.V) || e.KeyCode == Keys.Back || e.KeyCode == Keys.Delete)
+                ClearPlaceholder();
+        }
+
+        private void ShowPlaceholder()
+        {
+            _showingPlaceholder = true;
+            _tbDefinition.Text = _placeholderText;
+            _tbDefinition.ForeColor = _placeholderFore;
+            _tbDefinition.Select(0, 0);
+        }
+
+        private void ClearPlaceholder()
+        {
+            if (!_showingPlaceholder)
+                return;
+
+            _showingPlaceholder = false;
+            _tbDefinition.Clear();
+            _tbDefinition.ForeColor = _definitionFore;
         }
 
         public void ApplyThemeColors(Color formBack, Color formFore, Color windowBack, Color windowFore, bool dark, Color titleBarBack, Color titleBarFore)
@@ -484,12 +796,22 @@ namespace PS2Disassembler
             ForeColor = formFore;
             _footer.BackColor = actualFooterBack;
             _footer.ForeColor = formFore;
+            _definitionFore = windowFore;
+            _placeholderFore = dark ? Color.FromArgb(142, 148, 156) : Color.FromArgb(128, 128, 128);
             _tbDefinition.BackColor = actualEditorBack;
-            _tbDefinition.ForeColor = windowFore;
-            _btnAccept.BackColor = actualFooterBack;
+            _tbDefinition.ForeColor = _showingPlaceholder ? _placeholderFore : _definitionFore;
+            Color acceptBack = Color.FromArgb(actualFooterBack.A,
+                Math.Min(255, (int)Math.Round(actualFooterBack.R * 1.20f)),
+                Math.Min(255, (int)Math.Round(actualFooterBack.G * 1.20f)),
+                Math.Min(255, (int)Math.Round(actualFooterBack.B * 1.20f)));
+            _btnAccept.BackColor = acceptBack;
             _btnAccept.ForeColor = formFore;
             _btnAccept.FlatStyle = FlatStyle.Flat;
             _btnAccept.FlatAppearance.BorderColor = actualBorder;
+            _btnAccept.FlatAppearance.MouseOverBackColor = Color.FromArgb(acceptBack.A,
+                Math.Min(255, (int)Math.Round(acceptBack.R * 1.20f)),
+                Math.Min(255, (int)Math.Round(acceptBack.G * 1.20f)),
+                Math.Min(255, (int)Math.Round(acceptBack.B * 1.20f)));
             ApplyWindowChromeTheme(forceFrameRefresh: true);
         }
 
@@ -542,6 +864,334 @@ namespace PS2Disassembler
         }
     }
 
+    internal sealed class DefineObjectDialog : Form
+    {
+        private readonly MainForm.CenteredSingleLineTextBox _tbName;
+        private readonly Button _btnAdd;
+        private readonly Button _btnCancel;
+        private bool _dark;
+        private Color _formBack = SystemColors.Control;
+        private Color _formFore = SystemColors.ControlText;
+        private Color _windowFore = SystemColors.ControlText;
+
+        public string ObjectName => _tbName.Text.Trim();
+
+        public DefineObjectDialog(uint selectedAddress)
+        {
+            Text = $"Define Object - {selectedAddress:X8}";
+            ClientSize = new Size(420, 94);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            StartPosition = FormStartPosition.CenterParent;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            Font = new Font("Tahoma", 8.25f);
+
+            var lblName = new Label { Text = "Object Name:", AutoSize = true, Location = new Point(12, 17) };
+            _tbName = new MainForm.CenteredSingleLineTextBox
+            {
+                Location = new Point(100, 13),
+                Size = new Size(306, 24),
+            };
+            _tbName.TextChanged += (_, _) => UpdateButtonState();
+
+            _btnAdd = new Button { Text = "Add", Size = new Size(92, 27), Location = new Point(218, 56) };
+            _btnAdd.Click += (_, _) => Accept();
+            _btnCancel = new Button { Text = "Cancel", Size = new Size(92, 27), Location = new Point(314, 56) };
+            _btnCancel.Click += (_, _) => Close();
+
+            AcceptButton = _btnAdd;
+            CancelButton = _btnCancel;
+
+            Controls.AddRange(new Control[] { lblName, _tbName, _btnAdd, _btnCancel });
+
+            UpdateButtonState();
+
+            Shown += (_, _) =>
+            {
+                ActiveControl = _tbName;
+                _tbName.Focus();
+                _tbName.SelectAll();
+            };
+        }
+
+        private static Color BrightenButtonColor(Color color)
+        {
+            return Color.FromArgb(color.A,
+                Math.Min(255, (int)Math.Round(color.R * 1.20f)),
+                Math.Min(255, (int)Math.Round(color.G * 1.20f)),
+                Math.Min(255, (int)Math.Round(color.B * 1.20f)));
+        }
+
+        private void ApplyButtonState(Button button)
+        {
+            if (button == null)
+                return;
+
+            button.UseVisualStyleBackColor = false;
+            button.FlatStyle = FlatStyle.Flat;
+            Color enabledBack = BrightenButtonColor(_formBack);
+            Color hoverBack = BrightenButtonColor(_dark ? Color.FromArgb(58, 66, 78) : Color.FromArgb(210, 220, 235));
+            button.FlatAppearance.MouseOverBackColor = hoverBack;
+            button.FlatAppearance.MouseDownBackColor = _dark ? Color.FromArgb(70, 80, 94) : Color.FromArgb(190, 205, 225);
+
+            if (button.Enabled)
+            {
+                button.BackColor = enabledBack;
+                button.ForeColor = _formFore;
+                button.FlatAppearance.BorderColor = _windowFore;
+            }
+            else
+            {
+                button.BackColor = _dark ? Color.FromArgb(58, 62, 68) : Color.FromArgb(236, 236, 236);
+                button.ForeColor = _dark ? Color.FromArgb(160, 166, 174) : Color.FromArgb(128, 128, 128);
+                button.FlatAppearance.BorderColor = _dark ? Color.FromArgb(96, 102, 110) : Color.FromArgb(170, 170, 170);
+            }
+        }
+
+        private void UpdateButtonState()
+        {
+            _btnAdd.Enabled = !string.IsNullOrWhiteSpace(_tbName.Text);
+            ApplyButtonState(_btnAdd);
+            ApplyButtonState(_btnCancel);
+        }
+
+        private void Accept()
+        {
+            if (string.IsNullOrWhiteSpace(_tbName.Text))
+                return;
+
+            DialogResult = DialogResult.OK;
+            Close();
+        }
+
+        public void ApplyThemeColors(Color formBack, Color formFore, Color windowBack, Color windowFore, bool dark)
+        {
+            _dark = dark;
+            _formBack = formBack;
+            _formFore = formFore;
+            _windowFore = windowFore;
+
+            BackColor = formBack;
+            ForeColor = formFore;
+
+            foreach (Control control in Controls)
+            {
+                if (control is Label label)
+                {
+                    label.BackColor = formBack;
+                    label.ForeColor = formFore;
+                }
+                else if (control is Button button)
+                {
+                    button.BackColor = formBack;
+                    button.ForeColor = formFore;
+                    button.FlatStyle = FlatStyle.Flat;
+                    button.FlatAppearance.BorderColor = windowFore;
+                    ApplyButtonState(button);
+                }
+            }
+
+            _tbName.BackColor = windowBack;
+            _tbName.ForeColor = windowFore;
+            _tbName.BorderStyle = BorderStyle.FixedSingle;
+            ApplyButtonState(_btnAdd);
+            ApplyButtonState(_btnCancel);
+        }
+    }
+
+    internal sealed class AddObjectFieldLabelDialog : Form
+    {
+        private readonly MainForm.FlatComboBox _cbObject;
+        private readonly MainForm.CenteredSingleLineTextBox _tbLabel;
+        private readonly Button _btnUpdate;
+        private readonly Button _btnClose;
+        private readonly IReadOnlyList<MainForm.AddObjectLabelCandidate> _candidates;
+        private bool _dark;
+        private Color _formBack = SystemColors.Control;
+        private Color _formFore = SystemColors.ControlText;
+        private Color _windowFore = SystemColors.ControlText;
+
+        public uint? SelectedStaticAddress { get; private set; }
+        public uint SelectedOffset { get; private set; }
+        public string EnteredLabel => _tbLabel.Text.Trim();
+
+        public AddObjectFieldLabelDialog(uint selectedAddress, IReadOnlyList<MainForm.AddObjectLabelCandidate> candidates)
+        {
+            _candidates = candidates ?? Array.Empty<MainForm.AddObjectLabelCandidate>();
+
+            Text = "Add/Edit Object Label";
+            ClientSize = new Size(470, 124);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            StartPosition = FormStartPosition.CenterParent;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            Font = new Font("Tahoma", 8.25f);
+
+            var lblObject = new Label { Text = "Object", AutoSize = true, Location = new Point(12, 15) };
+            _cbObject = new MainForm.FlatComboBox
+            {
+                Location = new Point(95, 11),
+                Size = new Size(360, 24),
+                FormattingEnabled = true,
+            };
+            _cbObject.SelectedIndexChanged += (_, _) => UpdateSelectionState();
+
+            var lblLabel = new Label { Text = "Enter Label:", AutoSize = true, Location = new Point(12, 50) };
+            _tbLabel = new MainForm.CenteredSingleLineTextBox
+            {
+                Location = new Point(95, 46),
+                Size = new Size(360, 24),
+            };
+            _tbLabel.TextChanged += (_, _) => UpdateButtonState();
+
+            _btnUpdate = new Button { Text = "Update", Size = new Size(92, 27), Location = new Point(267, 86) };
+            _btnUpdate.Click += (_, _) => Accept();
+            _btnClose = new Button { Text = "Close", Size = new Size(92, 27), Location = new Point(363, 86) };
+            _btnClose.Click += (_, _) => Close();
+            CancelButton = _btnClose;
+            AcceptButton = _btnUpdate;
+
+            Controls.AddRange(new Control[] { lblObject, _cbObject, lblLabel, _tbLabel, _btnUpdate, _btnClose });
+
+            foreach (MainForm.AddObjectLabelCandidate candidate in _candidates)
+                _cbObject.Items.Add(candidate);
+            if (_cbObject.Items.Count > 0)
+                _cbObject.SelectedIndex = 0;
+
+            UpdateSelectionState();
+
+            Shown += (_, _) =>
+            {
+                ActiveControl = _tbLabel;
+                _tbLabel.Focus();
+                _tbLabel.SelectAll();
+            };
+        }
+
+        private void UpdateSelectionState()
+        {
+            if (_cbObject.SelectedItem is MainForm.AddObjectLabelCandidate candidate)
+            {
+                SelectedStaticAddress = candidate.Definition.StaticAddress;
+                SelectedOffset = candidate.Offset;
+                Text = $"Add/Edit Object Label - 0x{candidate.Offset:X}";
+                LoadExistingLabelForSelection(candidate);
+            }
+            else
+            {
+                SelectedStaticAddress = null;
+                SelectedOffset = 0;
+                Text = "Add/Edit Object Label";
+                LoadExistingLabelForSelection(null);
+            }
+
+            UpdateButtonState();
+        }
+
+        private void UpdateButtonState()
+        {
+            // Allow Update with an empty label so an existing object field label can be removed.
+            _btnUpdate.Enabled = SelectedStaticAddress.HasValue;
+            ApplyButtonState(_btnUpdate);
+            ApplyButtonState(_btnClose);
+        }
+
+        private void LoadExistingLabelForSelection(MainForm.AddObjectLabelCandidate? candidate)
+        {
+            string existingLabel = string.Empty;
+            if (candidate != null)
+            {
+                ObjectLabelField? field = candidate.Definition.Fields.FirstOrDefault(x => x.Offset == candidate.Offset);
+                if (field != null)
+                    existingLabel = field.Label?.Trim() ?? string.Empty;
+            }
+
+            _tbLabel.Text = existingLabel;
+            _tbLabel.SelectAll();
+        }
+
+        private static Color BrightenButtonColor(Color color)
+        {
+            return Color.FromArgb(color.A,
+                Math.Min(255, (int)Math.Round(color.R * 1.20f)),
+                Math.Min(255, (int)Math.Round(color.G * 1.20f)),
+                Math.Min(255, (int)Math.Round(color.B * 1.20f)));
+        }
+
+        private void ApplyButtonState(Button button)
+        {
+            if (button == null)
+                return;
+
+            button.UseVisualStyleBackColor = false;
+            button.FlatStyle = FlatStyle.Flat;
+            Color enabledBack = BrightenButtonColor(_formBack);
+            Color hoverBack = BrightenButtonColor(_dark ? Color.FromArgb(58, 66, 78) : Color.FromArgb(210, 220, 235));
+            button.FlatAppearance.MouseOverBackColor = hoverBack;
+            button.FlatAppearance.MouseDownBackColor = _dark ? Color.FromArgb(70, 80, 94) : Color.FromArgb(190, 205, 225);
+
+            if (button.Enabled)
+            {
+                button.BackColor = enabledBack;
+                button.ForeColor = _formFore;
+                button.FlatAppearance.BorderColor = _windowFore;
+            }
+            else
+            {
+                button.BackColor = _dark ? Color.FromArgb(58, 62, 68) : Color.FromArgb(236, 236, 236);
+                button.ForeColor = _dark ? Color.FromArgb(160, 166, 174) : Color.FromArgb(128, 128, 128);
+                button.FlatAppearance.BorderColor = _dark ? Color.FromArgb(96, 102, 110) : Color.FromArgb(170, 170, 170);
+            }
+        }
+
+        private void Accept()
+        {
+            if (!SelectedStaticAddress.HasValue)
+                return;
+
+            DialogResult = DialogResult.OK;
+            Close();
+        }
+
+        public void ApplyThemeColors(Color formBack, Color formFore, Color windowBack, Color windowFore, bool dark)
+        {
+            _dark = dark;
+            _formBack = formBack;
+            _formFore = formFore;
+            _windowFore = windowFore;
+
+            BackColor = formBack;
+            ForeColor = formFore;
+
+            foreach (Control control in Controls)
+            {
+                if (control is Label label)
+                {
+                    label.BackColor = formBack;
+                    label.ForeColor = formFore;
+                }
+                else if (control is Button button)
+                {
+                    button.BackColor = formBack;
+                    button.ForeColor = formFore;
+                    button.FlatStyle = FlatStyle.Flat;
+                    button.FlatAppearance.BorderColor = windowFore;
+                    ApplyButtonState(button);
+                }
+            }
+
+            _cbObject.BackColor = windowBack;
+            _cbObject.ForeColor = windowFore;
+            _tbLabel.BackColor = windowBack;
+            _tbLabel.ForeColor = windowFore;
+            _tbLabel.BorderStyle = BorderStyle.FixedSingle;
+            ApplyButtonState(_btnUpdate);
+            ApplyButtonState(_btnClose);
+        }
+    }
+
     internal sealed class LabelsWindowDialog : Form
     {
         public uint SelectedAddress { get; private set; }
@@ -582,6 +1232,7 @@ namespace PS2Disassembler
         private readonly Panel _objectBottom;
         private readonly ContextMenuStrip _objectMenu;
         private readonly Font _listFont = new Font("Courier New", 9f);
+        private const string ObjectDefinitionExampleText = "0020A588:ExampleObject\r\n0000:Label1\r\n0004:Label2\r\n02F0:Label3";
 
         private Color _windowBack = Color.White;
         private Color _windowFore = Color.Black;
@@ -625,6 +1276,13 @@ namespace PS2Disassembler
             _tabs.AddPage(objectPage);
             Controls.Add(_tabs);
             _tabs.SetTabVisible(1, _showObjectLabels);
+            _tabs.SelectedIndexChanged += (_, _) =>
+            {
+                if (IsHandleCreated)
+                    BeginInvoke((Action)UpdateColumnWidths);
+                else
+                    UpdateColumnWidths();
+            };
 
             _labelsTop = new Panel { Dock = DockStyle.Top, Height = 34 };
             _labelsBottom = new Panel { Dock = DockStyle.Bottom, Height = 38 };
@@ -644,7 +1302,6 @@ namespace PS2Disassembler
                 Location = new Point(48, 6),
                 Width = 370,
                 Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
-                Font = new Font("Courier New", 10f),
             };
             _search.TextChanged += OnSearchChanged;
             _search.KeyDown += OnSearchKeyDown;
@@ -888,6 +1545,14 @@ namespace PS2Disassembler
             _objectList.Invalidate();
         }
 
+        private static Color BrightenButtonColor(Color color)
+        {
+            return Color.FromArgb(color.A,
+                Math.Min(255, (int)Math.Round(color.R * 1.20f)),
+                Math.Min(255, (int)Math.Round(color.G * 1.20f)),
+                Math.Min(255, (int)Math.Round(color.B * 1.20f)));
+        }
+
         private void ApplyButtonState(Button button)
         {
             if (button == null)
@@ -895,12 +1560,14 @@ namespace PS2Disassembler
 
             button.UseVisualStyleBackColor = false;
             button.FlatStyle = FlatStyle.Flat;
-            button.FlatAppearance.MouseOverBackColor = _dark ? Color.FromArgb(58, 66, 78) : Color.FromArgb(210, 220, 235);
+            Color enabledBack = BrightenButtonColor(_formBack);
+            Color hoverBack = BrightenButtonColor(_dark ? Color.FromArgb(58, 66, 78) : Color.FromArgb(210, 220, 235));
+            button.FlatAppearance.MouseOverBackColor = hoverBack;
             button.FlatAppearance.MouseDownBackColor = _dark ? Color.FromArgb(70, 80, 94) : Color.FromArgb(190, 205, 225);
 
             if (button.Enabled)
             {
-                button.BackColor = _formBack;
+                button.BackColor = enabledBack;
                 button.ForeColor = _formFore;
                 button.FlatAppearance.BorderColor = _windowFore;
             }
@@ -1194,9 +1861,16 @@ namespace PS2Disassembler
         private void UpdateColumnWidths()
         {
             if (_labelList.Columns.Count >= 2)
-                _labelList.Columns[1].Width = Math.Max(120, _labelList.ClientSize.Width - _labelList.Columns[0].Width - 4);
+            {
+                int labelScrollbarWidth = _labelList.HasVerticalScrollbar ? SystemInformation.VerticalScrollBarWidth : 0;
+                _labelList.Columns[1].Width = Math.Max(120, _labelList.ClientSize.Width - _labelList.Columns[0].Width - labelScrollbarWidth - 1);
+            }
+
             if (_objectList.Columns.Count >= 2)
-                _objectList.Columns[1].Width = Math.Max(120, _objectList.ClientSize.Width - _objectList.Columns[0].Width - 4);
+            {
+                int objectScrollbarWidth = _objectList.HasVerticalScrollbar ? SystemInformation.VerticalScrollBarWidth : 0;
+                _objectList.Columns[1].Width = Math.Max(120, _objectList.ClientSize.Width - _objectList.Columns[0].Width - objectScrollbarWidth - 1);
+            }
         }
 
         private void OnSearchKeyDown(object? s, KeyEventArgs e)
@@ -1295,7 +1969,7 @@ namespace PS2Disassembler
 
         private void AddObjectDefinition()
         {
-            using var dlg = new AddObjectDefinitionDialog();
+            using var dlg = new AddObjectDefinitionDialog("Add Object Definition", "Add Object", string.Empty, ObjectDefinitionExampleText);
             dlg.ApplyThemeColors(_formBack, _formFore, _windowBack, _windowFore, _dark, _formBack, _formFore);
             if (dlg.ShowDialog(this) != DialogResult.OK || dlg.ObjectDefinition == null)
                 return;

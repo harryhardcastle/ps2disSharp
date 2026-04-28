@@ -7,25 +7,28 @@ namespace PS2Disassembler
     internal sealed class AppSettings
     {
         // Application version — increment by 0.0.001 whenever packaging the source into a zip
-        public const string AppVersion = "0.0.076";
+        public const string AppVersion = "0.0.113";
 
         // Defaults
         public const string DefaultFontFamily = "Liberation Mono";
         public const float DefaultFontSize = 9f;
         public const string DefaultTheme = "Dark";
+        public const string DefaultRowSpacing = "Compact";
         public const int DefaultRefreshRate = 30;
         public const int DefaultConstantWriteRate = 1;
         public const string DefaultDebugHost = "127.0.0.1";
         public const int DefaultPinePort = 28011;
         public const int DefaultMcpPort = 21512;
         public const bool DefaultShowMemoryView = true;
-        public const bool DefaultShowTabsInTitleBar = false;
+        public const bool DefaultShowTabsInTitleBar = true;
         public static readonly int[] SupportedRefreshRates = { 1, 10, 20, 30, 60, 100 };
+        public static readonly string[] SupportedRowSpacings = { "Compact", "Normal", "Large" };
         public static readonly int[] SupportedConstantWriteRates = { 1, 10, 20, 30, 60 };
 
         public string FontFamily { get; set; } = DefaultFontFamily;
         public float FontSize { get; set; } = DefaultFontSize;
         public string Theme { get; set; } = DefaultTheme;
+        public string RowSpacing { get; set; } = DefaultRowSpacing;
         public int RefreshRate { get; set; } = DefaultRefreshRate;
         public int ConstantWriteRate { get; set; } = DefaultConstantWriteRate;
         public string DebugHost { get; set; } = DefaultDebugHost;
@@ -76,6 +79,7 @@ namespace PS2Disassembler
             FontFamily = DefaultFontFamily;
             FontSize = DefaultFontSize;
             Theme = DefaultTheme;
+            RowSpacing = DefaultRowSpacing;
             RefreshRate = DefaultRefreshRate;
             ConstantWriteRate = DefaultConstantWriteRate;
             DebugHost = DefaultDebugHost;
@@ -92,6 +96,7 @@ namespace PS2Disassembler
             sb.AppendLine($"  \"FontFamily\": \"{EscapeJsonString(FontFamily)}\",");
             sb.AppendLine($"  \"FontSize\": {FontSize:F1},");
             sb.AppendLine($"  \"Theme\": \"{EscapeJsonString(Theme)}\",");
+            sb.AppendLine($"  \"RowSpacing\": \"{EscapeJsonString(NormalizeRowSpacing(RowSpacing))}\",");
             sb.AppendLine($"  \"RefreshRate\": {RefreshRate},");
             sb.AppendLine($"  \"ConstantWriteRate\": {ConstantWriteRate},");
             sb.AppendLine($"  \"DebugHost\": \"{EscapeJsonString(NormalizeDebugHost(DebugHost))}\",");
@@ -121,6 +126,9 @@ namespace PS2Disassembler
 
             string? theme = ExtractStringValue(json, "Theme");
             if (theme != null) settings.Theme = theme;
+
+            string? rowSpacing = ExtractStringValue(json, "RowSpacing");
+            settings.RowSpacing = NormalizeRowSpacing(rowSpacing);
 
             int? refreshRate = ExtractIntValue(json, "RefreshRate");
             if (refreshRate.HasValue && IsSupportedRefreshRate(refreshRate.Value))
@@ -165,6 +173,34 @@ namespace PS2Disassembler
 
             return json.Substring(quoteStart + 1, quoteEnd - quoteStart - 1)
                        .Replace("\\\\", "\\").Replace("\\\"", "\"");
+        }
+
+        public static bool IsSupportedRowSpacing(string? rowSpacing)
+        {
+            if (string.IsNullOrWhiteSpace(rowSpacing))
+                return false;
+
+            for (int i = 0; i < SupportedRowSpacings.Length; i++)
+            {
+                if (string.Equals(SupportedRowSpacings[i], rowSpacing.Trim(), StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        public static string NormalizeRowSpacing(string? rowSpacing)
+        {
+            if (string.IsNullOrWhiteSpace(rowSpacing))
+                return DefaultRowSpacing;
+
+            string trimmed = rowSpacing.Trim();
+            for (int i = 0; i < SupportedRowSpacings.Length; i++)
+            {
+                if (string.Equals(SupportedRowSpacings[i], trimmed, StringComparison.OrdinalIgnoreCase))
+                    return SupportedRowSpacings[i];
+            }
+
+            return DefaultRowSpacing;
         }
 
         public static bool IsSupportedRefreshRate(int refreshRate)
