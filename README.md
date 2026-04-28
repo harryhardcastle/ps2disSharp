@@ -43,4 +43,5 @@ gtlcpimp - Creator of Code Designer
 Hanimar - Creator of ps2dis  
 LXShadow - Creator of PCSX2dis  
 Sebastiano Gelmetti - Creator of PCSX2-MCP  
+Renegade - Idea for adding Code Designer  
 ChatGPT & Claude - Writing and breaking the code  
