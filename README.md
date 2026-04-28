@@ -13,6 +13,7 @@ ps2dis# is a disassembler for PS2 binaries and a debugger for PCSX2. It is heavi
 - Opening a file, or attaching to PCSX2, automatically analyzes memory. Re-analyze the memory by clicking Analyzer > Invoke Analyzer.
 - Imports labels from a PS2 ELF, binary, or PCSX2dis project.
 - The Analyzer > Debug Window will show the status of the PINE and MCP connections along with a log that tracks both. The log is not active when the window is closed.
+- Code Designer is based on Code Designer Lite: https://github.com/harryhardcastle/Code-Designer-Lite  
 
 **PCSX2 Features**
 - The Code Manager has 3 tabs: Codes, Patch Memory, and Search. The codes tab is for inputting raw hex codes similar to gameshark, and the codes are constantly written to memory. It supports 0, 1, 2, and D type codes. The Patch Memory tab is for patching memory. The codes in this tab are written to memory once, then cleared from the codes list. The Search tab is setup similar to Cheat Engine.
