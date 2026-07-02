@@ -258,6 +258,7 @@ namespace PS2Disassembler
         {
             DirectAddress,
             FunctionFingerprint,
+            VariableReference,
         }
 
         private readonly struct ImportedLabelTarget
@@ -272,6 +273,15 @@ namespace PS2Disassembler
             public ImportedLabelMatchKind Kind { get; }
         }
 
+        private sealed class ImportedLabelCollection
+        {
+            public Dictionary<uint, string> Labels { get; init; } = new();
+            public HashSet<uint> FunctionAddresses { get; init; } = new();
+            public HashSet<uint> VariableAddresses { get; init; } = new();
+            public Dictionary<uint, uint> FunctionSizes { get; init; } = new();
+            public int Skipped { get; init; }
+        }
+
         private sealed class ImportedLabelResolution
         {
             public Dictionary<uint, string> Labels { get; init; } = new();
@@ -284,6 +294,7 @@ namespace PS2Disassembler
         {
             public int Imported;
             public int FunctionMatched;
+            public int VariableReferenceMatched;
             public int DirectMatched;
             public int Unmatched;
         }
@@ -318,10 +329,13 @@ namespace PS2Disassembler
 
         private const int ImportedLabelFingerprintMinInstructions = 8;
         private const int ImportedLabelFingerprintMaxInstructions = 20;
+        private const int ImportedLabelReferenceDefaultFunctionBytes = 0x800;
+        private const int ImportedLabelReferenceMaxFunctionBytes = 0x4000;
+        private const int ImportedLabelReferenceLuiBacktrackBytes = 0x80;
 
         private static ImportedLabelResolution ResolveElfImportedLabels(ElfInfo elf, byte[] elfData, byte[] currentData, uint currentBase)
         {
-            var result = CollectElfLabelsStatic(elf);
+            var collection = CollectElfLabelsStatic(elf);
             byte[]? sourceImage = null;
             uint sourceBase = 0;
             bool usedSourceImage = false;
@@ -332,12 +346,20 @@ namespace PS2Disassembler
                 usedSourceImage = sourceImage.Length > 0;
             }
 
-            var targets = ResolveImportedLabelTargets(result.labels.Keys, sourceImage, sourceBase, currentData, currentBase);
+            var targets = ResolveImportedLabelTargets(collection.Labels.Keys, sourceImage, sourceBase, currentData, currentBase);
+            if (sourceImage != null && sourceImage.Length > 0)
+            {
+                ResolveImportedVariableReferenceTargets(
+                    sourceImage, sourceBase, currentData, currentBase,
+                    collection.Labels, collection.FunctionAddresses, collection.VariableAddresses,
+                    collection.FunctionSizes, targets);
+            }
+
             return new ImportedLabelResolution
             {
-                Labels = result.labels,
+                Labels = collection.Labels,
                 Targets = targets,
-                Skipped = result.skipped,
+                Skipped = collection.Skipped,
                 UsedSourceImage = usedSourceImage,
             };
         }
@@ -365,7 +387,26 @@ namespace PS2Disassembler
                 labelMap[NormalizeImportedLabelAddress(address)] = label;
             }
 
-            var targets = ResolveImportedLabelTargets(labelMap.Keys, sourceImage, 0x00000000u, currentData, currentBase);
+            uint sourceBase = 0x00000000u;
+            var functionAddresses = new HashSet<uint>();
+            var variableAddresses = new HashSet<uint>();
+            foreach (uint sourceAddress in labelMap.Keys)
+            {
+                if (TryBuildCodeFingerprintAtAddress(sourceImage, sourceBase, sourceAddress, out _))
+                    functionAddresses.Add(sourceAddress);
+                else
+                    variableAddresses.Add(sourceAddress);
+            }
+
+            var targets = ResolveImportedLabelTargets(labelMap.Keys, sourceImage, sourceBase, currentData, currentBase);
+            if (sourceImage.Length > 0)
+            {
+                ResolveImportedVariableReferenceTargets(
+                    sourceImage, sourceBase, currentData, currentBase,
+                    labelMap, functionAddresses, variableAddresses,
+                    new Dictionary<uint, uint>(), targets);
+            }
+
             return new ImportedLabelResolution
             {
                 Labels = labelMap,
@@ -399,6 +440,8 @@ namespace PS2Disassembler
                 apply.Imported++;
                 if (target.Kind == ImportedLabelMatchKind.FunctionFingerprint)
                     apply.FunctionMatched++;
+                else if (target.Kind == ImportedLabelMatchKind.VariableReference)
+                    apply.VariableReferenceMatched++;
                 else
                     apply.DirectMatched++;
             }
@@ -484,6 +527,280 @@ namespace PS2Disassembler
             }
 
             return targets;
+        }
+
+        private readonly struct ImportedAddressReference
+        {
+            public ImportedAddressReference(int relativeOffset, uint address)
+            {
+                RelativeOffset = relativeOffset;
+                Address = address;
+            }
+
+            public int RelativeOffset { get; }
+            public uint Address { get; }
+        }
+
+        private static void ResolveImportedVariableReferenceTargets(
+            byte[] sourceImage,
+            uint sourceBase,
+            byte[] currentData,
+            uint currentBase,
+            IReadOnlyDictionary<uint, string> labels,
+            IEnumerable<uint> sourceFunctionAddresses,
+            IEnumerable<uint> sourceVariableAddresses,
+            IReadOnlyDictionary<uint, uint> sourceFunctionSizes,
+            Dictionary<uint, ImportedLabelTarget> targets)
+        {
+            if (sourceImage.Length == 0 || currentData.Length == 0 || labels.Count == 0 || targets.Count == 0)
+                return;
+
+            var variableSet = new HashSet<uint>(sourceVariableAddresses.Select(NormalizeImportedLabelAddress));
+            variableSet.RemoveWhere(address => !labels.ContainsKey(address));
+            if (variableSet.Count == 0)
+                return;
+
+            var candidates = new Dictionary<uint, uint>();
+            var conflicts = new HashSet<uint>();
+
+            foreach (uint rawSourceFunction in sourceFunctionAddresses)
+            {
+                uint sourceFunction = NormalizeImportedLabelAddress(rawSourceFunction);
+                if (!labels.ContainsKey(sourceFunction))
+                    continue;
+                if (!targets.TryGetValue(sourceFunction, out var targetFunction))
+                    continue;
+                if (!TryGetImageOffsetForNormalizedAddress(sourceFunction, sourceBase, sourceImage, out int sourceFunctionOffset))
+                    continue;
+                if (!TryGetImageOffsetForNormalizedAddress(targetFunction.Address, currentBase, currentData, out int targetFunctionOffset))
+                    continue;
+
+                int scanBytes = GetImportedFunctionReferenceScanByteCount(
+                    sourceImage, sourceFunctionOffset, currentData, targetFunctionOffset,
+                    sourceFunction, sourceFunctionSizes);
+                if (scanBytes < 4)
+                    continue;
+
+                foreach (var sourceReference in EnumerateImportedAddressReferences(sourceImage, sourceFunctionOffset, scanBytes))
+                {
+                    uint sourceVariableAddress = NormalizeImportedLabelAddress(sourceReference.Address);
+                    if (!variableSet.Contains(sourceVariableAddress))
+                        continue;
+
+                    int targetInstructionOffset = targetFunctionOffset + sourceReference.RelativeOffset;
+                    if (!TryDecodeMipsAbsoluteAddressReferenceAtOffset(currentData, targetFunctionOffset, targetInstructionOffset, out uint targetVariableAddress))
+                        continue;
+
+                    targetVariableAddress = NormalizeImportedLabelAddress(targetVariableAddress);
+                    if (!IsAddressInsideImage(targetVariableAddress, currentBase, currentData))
+                        continue;
+
+                    AddImportedVariableReferenceCandidate(candidates, conflicts, sourceVariableAddress, targetVariableAddress);
+                }
+            }
+
+            foreach (var (sourceVariableAddress, targetVariableAddress) in candidates)
+            {
+                if (conflicts.Contains(sourceVariableAddress) || !labels.ContainsKey(sourceVariableAddress))
+                    continue;
+
+                if (targets.TryGetValue(sourceVariableAddress, out var existingTarget) &&
+                    existingTarget.Kind != ImportedLabelMatchKind.DirectAddress)
+                {
+                    continue;
+                }
+
+                targets[sourceVariableAddress] = new ImportedLabelTarget(targetVariableAddress, ImportedLabelMatchKind.VariableReference);
+            }
+        }
+
+        private static void AddImportedVariableReferenceCandidate(
+            Dictionary<uint, uint> candidates,
+            HashSet<uint> conflicts,
+            uint sourceVariableAddress,
+            uint targetVariableAddress)
+        {
+            sourceVariableAddress = NormalizeImportedLabelAddress(sourceVariableAddress);
+            targetVariableAddress = NormalizeImportedLabelAddress(targetVariableAddress);
+            if (conflicts.Contains(sourceVariableAddress))
+                return;
+
+            if (candidates.TryGetValue(sourceVariableAddress, out uint existingTargetAddress))
+            {
+                if (existingTargetAddress != targetVariableAddress)
+                {
+                    candidates.Remove(sourceVariableAddress);
+                    conflicts.Add(sourceVariableAddress);
+                }
+                return;
+            }
+
+            candidates[sourceVariableAddress] = targetVariableAddress;
+        }
+
+        private static IEnumerable<ImportedAddressReference> EnumerateImportedAddressReferences(byte[] image, int functionOffset, int byteCount)
+        {
+            int alignedByteCount = Math.Max(0, byteCount & ~3);
+            int endOffset = Math.Min(image.Length, functionOffset + alignedByteCount);
+            for (int instructionOffset = functionOffset; instructionOffset + 4 <= endOffset; instructionOffset += 4)
+            {
+                if (TryDecodeMipsAbsoluteAddressReferenceAtOffset(image, functionOffset, instructionOffset, out uint address))
+                    yield return new ImportedAddressReference(instructionOffset - functionOffset, address);
+            }
+        }
+
+        private static int GetImportedFunctionReferenceScanByteCount(
+            byte[] sourceImage,
+            int sourceFunctionOffset,
+            byte[] currentData,
+            int targetFunctionOffset,
+            uint sourceFunctionAddress,
+            IReadOnlyDictionary<uint, uint> sourceFunctionSizes)
+        {
+            int available = Math.Min(sourceImage.Length - sourceFunctionOffset, currentData.Length - targetFunctionOffset);
+            if (available <= 0)
+                return 0;
+
+            int maxAvailable = Math.Min(available, ImportedLabelReferenceMaxFunctionBytes);
+            int requested = ImportedLabelReferenceDefaultFunctionBytes;
+
+            if (sourceFunctionSizes.TryGetValue(sourceFunctionAddress, out uint sourceSize) && sourceSize > 0)
+                requested = (int)Math.Min(sourceSize, (uint)ImportedLabelReferenceMaxFunctionBytes);
+            else
+                requested = Math.Max(ImportedLabelFingerprintMinInstructions * 4, FindImportedFunctionByteCountByReturn(sourceImage, sourceFunctionOffset, maxAvailable));
+
+            return Math.Max(0, Math.Min(requested, maxAvailable) & ~3);
+        }
+
+        private static int FindImportedFunctionByteCountByReturn(byte[] image, int functionOffset, int maxBytes)
+        {
+            int alignedMaxBytes = Math.Max(0, maxBytes & ~3);
+            int endOffset = Math.Min(image.Length, functionOffset + alignedMaxBytes);
+            for (int instructionOffset = functionOffset; instructionOffset + 4 <= endOffset; instructionOffset += 4)
+            {
+                uint word = ReadU32LE(image, instructionOffset);
+                if (IsMipsReturnInstruction(word))
+                    return Math.Min(alignedMaxBytes, instructionOffset - functionOffset + 8); // include delay slot
+            }
+            return Math.Min(alignedMaxBytes, ImportedLabelReferenceDefaultFunctionBytes);
+        }
+
+        private static bool TryDecodeMipsAbsoluteAddressReferenceAtOffset(byte[] image, int functionOffset, int instructionOffset, out uint address)
+        {
+            address = 0;
+            if (instructionOffset < functionOffset || instructionOffset + 4 > image.Length)
+                return false;
+
+            uint word = ReadU32LE(image, instructionOffset);
+            uint op = word >> 26;
+            int rs = (int)((word >> 21) & 0x1F);
+            ushort imm = (ushort)(word & 0xFFFF);
+            bool useSignedLow;
+
+            if (IsMipsMemoryAddressOpcode(op))
+            {
+                useSignedLow = true;
+            }
+            else if (op == 0x09 || op == 0x19) // addiu / daddiu address materialization
+            {
+                useSignedLow = true;
+            }
+            else if (op == 0x0D) // ori address materialization
+            {
+                useSignedLow = false;
+            }
+            else
+            {
+                return false;
+            }
+
+            if (rs == 0)
+                return false;
+
+            if (!TryFindPriorLuiForRegister(image, functionOffset, instructionOffset, rs, out ushort highImmediate))
+                return false;
+
+            uint high = (uint)highImmediate << 16;
+            uint low = useSignedLow ? unchecked((uint)(int)(short)imm) : imm;
+            address = NormalizeImportedLabelAddress(useSignedLow ? unchecked(high + low) : (high | low));
+            return true;
+        }
+
+        private static bool IsMipsMemoryAddressOpcode(uint op)
+            => op is 0x20 or 0x21 or 0x22 or 0x23 or 0x24 or 0x25 or 0x26 or 0x27 or
+                     0x28 or 0x29 or 0x2A or 0x2B or 0x2E or 0x2F or
+                     0x30 or 0x31 or 0x32 or 0x33 or 0x34 or 0x35 or 0x36 or 0x37 or
+                     0x38 or 0x39 or 0x3A or 0x3B or 0x3C or 0x3D or 0x3E or 0x3F or
+                     0x1A or 0x1B or 0x1E or 0x1F;
+
+        private static bool TryFindPriorLuiForRegister(byte[] image, int functionOffset, int instructionOffset, int register, out ushort highImmediate)
+        {
+            highImmediate = 0;
+            int lowerBound = Math.Max(functionOffset, instructionOffset - ImportedLabelReferenceLuiBacktrackBytes);
+            for (int prevOffset = instructionOffset - 4; prevOffset >= lowerBound; prevOffset -= 4)
+            {
+                uint prevWord = ReadU32LE(image, prevOffset);
+                if (IsMipsLuiToRegister(prevWord, register, out highImmediate))
+                    return true;
+
+                if (MipsInstructionWritesRegister(prevWord, register))
+                    return false;
+            }
+
+            return false;
+        }
+
+        private static bool IsMipsLuiToRegister(uint word, int register, out ushort highImmediate)
+        {
+            highImmediate = 0;
+            uint op = word >> 26;
+            int rt = (int)((word >> 16) & 0x1F);
+            if (op != 0x0F || rt != register)
+                return false;
+
+            highImmediate = (ushort)(word & 0xFFFF);
+            return true;
+        }
+
+        private static bool MipsInstructionWritesRegister(uint word, int register)
+        {
+            if (register <= 0)
+                return false;
+
+            uint op = word >> 26;
+            int rt = (int)((word >> 16) & 0x1F);
+            int rd = (int)((word >> 11) & 0x1F);
+
+            if (op == 0x00)
+            {
+                uint funct = word & 0x3F;
+                if (funct == 0x08 || funct == 0x0C || funct == 0x0D)
+                    return false; // jr / syscall / break
+                if (funct == 0x09)
+                    return rd == register || (rd == 0 && register == 31); // jalr
+                return rd == register;
+            }
+
+            if (op == 0x03)
+                return register == 31; // jal
+
+            if (op == 0x01)
+            {
+                uint rtField = (word >> 16) & 0x1F;
+                return (rtField == 0x10 || rtField == 0x11) && register == 31; // bltzal / bgezal
+            }
+
+            if (op is 0x02 or 0x04 or 0x05 or 0x06 or 0x07)
+                return false;
+
+            if (op is 0x28 or 0x29 or 0x2A or 0x2B or 0x2C or 0x2D or 0x2E or 0x2F or
+                    0x38 or 0x39 or 0x3A or 0x3B or 0x3C or 0x3D or 0x3E or 0x3F)
+                return false;
+
+            if (op is 0x10 or 0x11 or 0x12 or 0x13)
+                return false; // coprocessor operations do not write a GPR rt in the forms used here
+
+            return rt == register;
         }
 
         private static bool CanUseDirectImportedLabelAddress(byte[] sourceImage, uint sourceBase, byte[] currentData, uint currentBase, uint sourceAddress)
@@ -614,9 +931,9 @@ namespace PS2Disassembler
             return word & 0xFFFF0000u;
         }
 
-        private static (Dictionary<uint, string> labels, int skipped) CollectElfLabelsStatic(ElfInfo elf)
+        private static ImportedLabelCollection CollectElfLabelsStatic(ElfInfo elf)
         {
-            var bestByAddress = new Dictionary<uint, (string Label, int Score)>();
+            var bestByAddress = new Dictionary<uint, (string Label, int Score, bool IsFunction, bool IsVariable, uint FunctionSize)>();
             int skipped = 0;
 
             foreach (var sym in elf.Symbols)
@@ -627,16 +944,59 @@ namespace PS2Disassembler
                     continue;
                 }
 
+                bool isFunction = IsElfImportedFunctionSymbol(sym);
+                bool isVariable = IsElfImportedVariableSymbol(sym);
+                uint functionSize = isFunction ? sym.Size : 0;
+
                 if (!bestByAddress.TryGetValue(address, out var existing) ||
                     score > existing.Score ||
                     (score == existing.Score && label.Length > existing.Label.Length))
                 {
-                    bestByAddress[address] = (label, score);
+                    bestByAddress[address] = (label, score, isFunction, isVariable, functionSize);
+                }
+                else if (score == existing.Score)
+                {
+                    bestByAddress[address] = (
+                        existing.Label, existing.Score,
+                        existing.IsFunction || isFunction,
+                        existing.IsVariable || isVariable,
+                        existing.FunctionSize != 0 ? existing.FunctionSize : functionSize);
                 }
             }
 
-            return (bestByAddress.ToDictionary(kv => kv.Key, kv => kv.Value.Label), skipped);
+            var labels = new Dictionary<uint, string>(bestByAddress.Count);
+            var functions = new HashSet<uint>();
+            var variables = new HashSet<uint>();
+            var functionSizes = new Dictionary<uint, uint>();
+
+            foreach (var (address, entry) in bestByAddress)
+            {
+                labels[address] = entry.Label;
+                if (entry.IsFunction)
+                {
+                    functions.Add(address);
+                    if (entry.FunctionSize > 0)
+                        functionSizes[address] = entry.FunctionSize;
+                }
+                if (entry.IsVariable)
+                    variables.Add(address);
+            }
+
+            return new ImportedLabelCollection
+            {
+                Labels = labels,
+                FunctionAddresses = functions,
+                VariableAddresses = variables,
+                FunctionSizes = functionSizes,
+                Skipped = skipped,
+            };
         }
+
+        private static bool IsElfImportedFunctionSymbol(ElfSymbol sym)
+            => sym.Type == 2; // STT_FUNC
+
+        private static bool IsElfImportedVariableSymbol(ElfSymbol sym)
+            => sym.Type == 1; // STT_OBJECT
 
         private static bool TryGetElfImportLabelStatic(ElfSymbol sym, out uint address, out string label, out int score)
         {
@@ -718,7 +1078,7 @@ namespace PS2Disassembler
                 ? "\nMatching project labels were merged as ImportedLabel #ProjectLabel."
                 : string.Empty;
             string matchNote = resolution.UsedSourceImage
-                ? $"\nFunction-matched: {applied.FunctionMatched:N0}; direct verified: {applied.DirectMatched:N0}; unmatched/skipped by matcher: {applied.Unmatched:N0}."
+                ? $"\nFunction-matched: {applied.FunctionMatched:N0}; variable-reference matched: {applied.VariableReferenceMatched:N0}; direct verified: {applied.DirectMatched:N0}; unmatched/skipped by matcher: {applied.Unmatched:N0}."
                 : $"\nDirect-address imported: {applied.DirectMatched:N0}; unmatched: {applied.Unmatched:N0}.";
 
             MessageBox.Show(this,
@@ -757,7 +1117,7 @@ namespace PS2Disassembler
             _sbProgress.Text = $"Imported {applied.Imported} label(s) from .pis file.";
 
             string matchNote = resolution.UsedSourceImage
-                ? $"\nFunction-matched: {applied.FunctionMatched:N0}; direct verified: {applied.DirectMatched:N0}; unmatched/skipped by matcher: {applied.Unmatched:N0}."
+                ? $"\nFunction-matched: {applied.FunctionMatched:N0}; variable-reference matched: {applied.VariableReferenceMatched:N0}; direct verified: {applied.DirectMatched:N0}; unmatched/skipped by matcher: {applied.Unmatched:N0}."
                 : $"\nDirect-address imported: {applied.DirectMatched:N0}; unmatched: {applied.Unmatched:N0}.";
 
             MessageBox.Show(this,
